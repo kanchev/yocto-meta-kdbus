@@ -1,0 +1,6766 @@
+From 469303820a999d06d11c8a8b592931ab8388c922 Mon Sep 17 00:00:00 2001
+From: Javier Martinez Canillas <javier.martinez@collabora.co.uk>
+Date: Thu, 7 Jun 2012 10:02:46 +0200
+Subject: [PATCH 1/1] net: bus: add the AF_BUS socket address family and
+ netfilter dbus module
+
+AF_BUS is a new socket address family that allows both unicast and multicast I
+on a local machine with total ordering for messages (every process on the same
+bus sees each message in the same order).
+
+A process can create buses to which other processes can connect and communicat
+with each other by sending messages. Processes' addresses are automatically
+assigned by the bus on connect and are unique. Messages can be sent either to
+process' unique address or to a bus multicast addresses.
+
+The netfilter nfdbus module is able to parse D-Bus messages and take filtering
+decisions based on the information on each message header.
+
+upstream ref: 6e01c95f3d2483c3d95b0468c8e3040657e6cb19
+
+Signed-off-by: Javier Martinez Canillas <javier.martinez@collabora.co.uk>
+---
+ Documentation/connector/cn_test.c      |    2 +-
+ Documentation/connector/connector.txt  |    4 +-
+ drivers/block/drbd/drbd_nl.c           |    2 +-
+ drivers/connector/cn_proc.c            |    3 +-
+ drivers/connector/cn_queue.c           |    4 +-
+ drivers/connector/connector.c          |   37 +-
+ drivers/md/dm-log-userspace-transfer.c |    2 +-
+ drivers/video/uvesafb.c                |    2 +-
+ drivers/w1/w1_netlink.c                |    2 +-
+ include/linux/bus.h                    |   25 +
+ include/linux/connector.h              |   11 +-
+ include/linux/netfilter.h              |    1 +
+ include/linux/security.h               |    9 +
+ include/linux/socket.h                 |    9 +-
+ include/net/af_bus.h                   |  175 ++
+ net/Kconfig                            |    1 +
+ net/Makefile                           |    1 +
+ net/bridge/br_netfilter.c              |   28 +-
+ net/bus/Kconfig                        |   14 +
+ net/bus/Makefile                       |    8 +
+ net/bus/af_bus.c                       | 2749 ++++++++++++++++++++++++++++++++
+ net/bus/garbage.c                      |  322 ++++
+ net/bus/sysctl_net_bus.c               |   59 +
+ net/core/scm.c                         |    3 +-
+ net/core/sock.c                        |    6 +-
+ net/decnet/netfilter/dn_rtmsg.c        |    2 +-
+ net/netfilter/Kconfig                  |    2 +
+ net/netfilter/Makefile                 |    3 +
+ net/netfilter/core.c                   |    5 +
+ net/netfilter/nfdbus/Kconfig           |   12 +
+ net/netfilter/nfdbus/Makefile          |    6 +
+ net/netfilter/nfdbus/dbus-protocol.h   |  473 ++++++
+ net/netfilter/nfdbus/matchrule.c       | 1224 ++++++++++++++
+ net/netfilter/nfdbus/matchrule.h       |   86 +
+ net/netfilter/nfdbus/message.c         |  290 ++++
+ net/netfilter/nfdbus/message.h         |   65 +
+ net/netfilter/nfdbus/nfdbus.c          |  388 +++++
+ net/netfilter/nfdbus/nfdbus.h          |   44 +
+ security/capability.c                  |    7 +
+ security/security.c                    |    6 +
+ security/selinux/hooks.c               |   34 +
+ 41 files changed, 6089 insertions(+), 37 deletions(-)
+ create mode 100644 include/linux/bus.h
+ create mode 100644 include/net/af_bus.h
+ create mode 100644 net/bus/Kconfig
+ create mode 100644 net/bus/Makefile
+ create mode 100644 net/bus/af_bus.c
+ create mode 100644 net/bus/garbage.c
+ create mode 100644 net/bus/sysctl_net_bus.c
+ create mode 100644 net/netfilter/nfdbus/Kconfig
+ create mode 100644 net/netfilter/nfdbus/Makefile
+ create mode 100644 net/netfilter/nfdbus/dbus-protocol.h
+ create mode 100644 net/netfilter/nfdbus/matchrule.c
+ create mode 100644 net/netfilter/nfdbus/matchrule.h
+ create mode 100644 net/netfilter/nfdbus/message.c
+ create mode 100644 net/netfilter/nfdbus/message.h
+ create mode 100644 net/netfilter/nfdbus/nfdbus.c
+ create mode 100644 net/netfilter/nfdbus/nfdbus.h
+
+diff --git a/Documentation/connector/cn_test.c b/Documentation/connector/cn_test.c
+index 7764594..9b6fbe3 100644
+--- a/Documentation/connector/cn_test.c
++++ b/Documentation/connector/cn_test.c
+@@ -35,7 +35,7 @@ static char cn_test_name[] = "cn_test";
+ static struct sock *nls;
+ static struct timer_list cn_test_timer;
+ 
+-static void cn_test_callback(struct cn_msg *msg, struct netlink_skb_parms *nsp)
++static void cn_test_callback(struct net *net, struct cn_msg *msg, struct netlink_skb_parms *nsp)
+ {
+ 	pr_info("%s: %lu: idx=%x, val=%x, seq=%u, ack=%u, len=%d: %s.\n",
+ 	        __func__, jiffies, msg->id.idx, msg->id.val,
+diff --git a/Documentation/connector/connector.txt b/Documentation/connector/connector.txt
+index e5c5f5e..65369bf 100644
+--- a/Documentation/connector/connector.txt
++++ b/Documentation/connector/connector.txt
+@@ -23,7 +23,7 @@ handling, etc...  The Connector driver allows any kernelspace agents to use
+ netlink based networking for inter-process communication in a significantly
+ easier way:
+ 
+-int cn_add_callback(struct cb_id *id, char *name, void (*callback) (struct cn_msg *, struct netlink_skb_parms *));
++int cn_add_callback(struct cb_id *id, char *name, void (*callback) (struct net*, struct cn_msg *, struct netlink_skb_parms *));
+ void cn_netlink_send(struct cn_msg *msg, u32 __group, int gfp_mask);
+ 
+ struct cb_id
+@@ -53,7 +53,7 @@ struct cn_msg
+ Connector interfaces.
+ /*****************************************/
+ 
+-int cn_add_callback(struct cb_id *id, char *name, void (*callback) (struct cn_msg *, struct netlink_skb_parms *));
++int cn_add_callback(struct cb_id *id, char *name, void (*callback) (struct net*, struct cn_msg *, struct netlink_skb_parms *));
+ 
+  Registers new callback with connector core.
+ 
+diff --git a/drivers/block/drbd/drbd_nl.c b/drivers/block/drbd/drbd_nl.c
+index 515bcd9..fbf344c 100644
+--- a/drivers/block/drbd/drbd_nl.c
++++ b/drivers/block/drbd/drbd_nl.c
+@@ -2280,7 +2280,7 @@ static struct cn_handler_struct cnd_table[] = {
+ 	[ P_new_c_uuid ]	= { &drbd_nl_new_c_uuid,	0 },
+ };
+ 
+-static void drbd_connector_callback(struct cn_msg *req, struct netlink_skb_parms *nsp)
++static void drbd_connector_callback(struct net *net, struct cn_msg *req, struct netlink_skb_parms *nsp)
+ {
+ 	struct drbd_nl_cfg_req *nlp = (struct drbd_nl_cfg_req *)req->data;
+ 	struct cn_handler_struct *cm;
+diff --git a/drivers/connector/cn_proc.c b/drivers/connector/cn_proc.c
+index 2b46a7e..55d9ed7 100644
+--- a/drivers/connector/cn_proc.c
++++ b/drivers/connector/cn_proc.c
+@@ -229,7 +229,8 @@ static void cn_proc_ack(int err, int rcvd_seq, int rcvd_ack)
+  * cn_proc_mcast_ctl
+  * @data: message sent from userspace via the connector
+  */
+-static void cn_proc_mcast_ctl(struct cn_msg *msg,
++static void cn_proc_mcast_ctl(struct net *net,
++			      struct cn_msg *msg,
+ 			      struct netlink_skb_parms *nsp)
+ {
+ 	enum proc_cn_mcast_op *mc_op = NULL;
+diff --git a/drivers/connector/cn_queue.c b/drivers/connector/cn_queue.c
+index c42c9d5..ff6d80f 100644
+--- a/drivers/connector/cn_queue.c
++++ b/drivers/connector/cn_queue.c
+@@ -34,7 +34,7 @@
+ static struct cn_callback_entry *
+ cn_queue_alloc_callback_entry(struct cn_queue_dev *dev, const char *name,
+ 			      struct cb_id *id,
+-			      void (*callback)(struct cn_msg *, struct netlink_skb_parms *))
++			      void (*callback)(struct net *,struct cn_msg *, struct netlink_skb_parms *))
+ {
+ 	struct cn_callback_entry *cbq;
+ 
+@@ -71,7 +71,7 @@ int cn_cb_equal(struct cb_id *i1, struct cb_id *i2)
+ 
+ int cn_queue_add_callback(struct cn_queue_dev *dev, const char *name,
+ 			  struct cb_id *id,
+-			  void (*callback)(struct cn_msg *, struct netlink_skb_parms *))
++			  void (*callback)(struct net *, struct cn_msg *, struct netlink_skb_parms *))
+ {
+ 	struct cn_callback_entry *cbq, *__cbq;
+ 	int found = 0;
+diff --git a/drivers/connector/connector.c b/drivers/connector/connector.c
+index dde6a0f..c7324bc 100644
+--- a/drivers/connector/connector.c
++++ b/drivers/connector/connector.c
+@@ -118,6 +118,38 @@ nlmsg_failure:
+ EXPORT_SYMBOL_GPL(cn_netlink_send);
+ 
+ /*
++ * Send an unicast reply from a connector callback
++ *
++ */
++int cn_netlink_reply(struct cn_msg *msg, u32 pid, gfp_t gfp_mask)
++{
++	unsigned int size;
++	struct sk_buff *skb;
++	struct nlmsghdr *nlh;
++	struct cn_msg *data;
++	struct cn_dev *dev = &cdev;
++
++	size = NLMSG_SPACE(sizeof(*msg) + msg->len);
++
++	skb = alloc_skb(size, gfp_mask);
++	if (!skb)
++		return -ENOMEM;
++
++	nlh = NLMSG_PUT(skb, 0, msg->seq, NLMSG_DONE, size - sizeof(*nlh));
++
++	data = NLMSG_DATA(nlh);
++
++	memcpy(data, msg, sizeof(*data) + msg->len);
++
++	return netlink_unicast(dev->nls, skb, pid, 1);
++
++nlmsg_failure:
++	kfree_skb(skb);
++	return -EINVAL;
++}
++EXPORT_SYMBOL_GPL(cn_netlink_reply);
++
++/*
+  * Callback helper - queues work and setup destructor for given data.
+  */
+ static int cn_call_callback(struct sk_buff *skb)
+@@ -126,6 +158,7 @@ static int cn_call_callback(struct sk_buff *skb)
+ 	struct cn_dev *dev = &cdev;
+ 	struct cn_msg *msg = NLMSG_DATA(nlmsg_hdr(skb));
+ 	struct netlink_skb_parms *nsp = &NETLINK_CB(skb);
++	struct net *net = sock_net(skb->sk);
+ 	int err = -ENODEV;
+ 
+ 	spin_lock_bh(&dev->cbdev->queue_lock);
+@@ -140,7 +173,7 @@ static int cn_call_callback(struct sk_buff *skb)
+ 
+ 	if (cbq != NULL) {
+ 		err = 0;
+-		cbq->callback(msg, nsp);
++		cbq->callback(net, msg, nsp);
+ 		kfree_skb(skb);
+ 		cn_queue_release_callback(cbq);
+ 		err = 0;
+@@ -185,7 +218,7 @@ static void cn_rx_skb(struct sk_buff *__skb)
+  * May sleep.
+  */
+ int cn_add_callback(struct cb_id *id, const char *name,
+-		    void (*callback)(struct cn_msg *, struct netlink_skb_parms *))
++		    void (*callback)(struct net*, struct cn_msg *, struct netlink_skb_parms *))
+ {
+ 	int err;
+ 	struct cn_dev *dev = &cdev;
+diff --git a/drivers/md/dm-log-userspace-transfer.c b/drivers/md/dm-log-userspace-transfer.c
+index 1f23e04..2bea7d1 100644
+--- a/drivers/md/dm-log-userspace-transfer.c
++++ b/drivers/md/dm-log-userspace-transfer.c
+@@ -130,7 +130,7 @@ static int fill_pkg(struct cn_msg *msg, struct dm_ulog_request *tfr)
+  * This is the connector callback that delivers data
+  * that was sent from userspace.
+  */
+-static void cn_ulog_callback(struct cn_msg *msg, struct netlink_skb_parms *nsp)
++static void cn_ulog_callback(struct net *net, struct cn_msg *msg, struct netlink_skb_parms *nsp)
+ {
+ 	struct dm_ulog_request *tfr = (struct dm_ulog_request *)(msg + 1);
+ 
+diff --git a/drivers/video/uvesafb.c b/drivers/video/uvesafb.c
+index 7f8472c..5c91a3d 100644
+--- a/drivers/video/uvesafb.c
++++ b/drivers/video/uvesafb.c
+@@ -68,7 +68,7 @@ static DEFINE_MUTEX(uvfb_lock);
+  * find the kernel part of the task struct, copy the registers and
+  * the buffer contents and then complete the task.
+  */
+-static void uvesafb_cn_callback(struct cn_msg *msg, struct netlink_skb_parms *nsp)
++static void uvesafb_cn_callback(struct net *net, struct cn_msg *msg, struct netlink_skb_parms *nsp)
+ {
+ 	struct uvesafb_task *utask;
+ 	struct uvesafb_ktask *task;
+diff --git a/drivers/w1/w1_netlink.c b/drivers/w1/w1_netlink.c
+index 55aabd9..de9d656 100644
+--- a/drivers/w1/w1_netlink.c
++++ b/drivers/w1/w1_netlink.c
+@@ -310,7 +310,7 @@ static int w1_netlink_send_error(struct cn_msg *rcmsg, struct w1_netlink_msg *rm
+ 	return error;
+ }
+ 
+-static void w1_cn_callback(struct cn_msg *msg, struct netlink_skb_parms *nsp)
++static void w1_cn_callback(struct net *net, struct cn_msg *msg, struct netlink_skb_parms *nsp)
+ {
+ 	struct w1_netlink_msg *m = (struct w1_netlink_msg *)(msg + 1);
+ 	struct w1_netlink_cmd *cmd;
+diff --git a/include/linux/bus.h b/include/linux/bus.h
+new file mode 100644
+index 0000000..2bdd375
+--- /dev/null
++++ b/include/linux/bus.h
+@@ -0,0 +1,25 @@
++#ifndef _LINUX_BUS_H
++#define _LINUX_BUS_H
++
++#include <linux/socket.h>
++
++/* 'protocol' to use in socket(AF_BUS, SOCK_SEQPACKET, protocol) */
++#define BUS_PROTO_NONE	0
++#define BUS_PROTO_DBUS	1
++#define BUS_PROTO_MAX	1
++
++#define BUS_PATH_MAX	108
++
++/* Bus address */
++struct bus_addr {
++	u64 s_addr; /* 16-bit prefix + 48-bit client address */
++};
++
++/* Structure describing an AF_BUS socket address. */
++struct sockaddr_bus {
++	sa_family_t sbus_family;         /* AF_BUS */
++	struct bus_addr      sbus_addr;  /* bus address */
++	char sbus_path[BUS_PATH_MAX];    /* pathname */
++};
++
++#endif /* _LINUX_BUS_H */
+diff --git a/include/linux/connector.h b/include/linux/connector.h
+index f696bcc..0714fd1 100644
+--- a/include/linux/connector.h
++++ b/include/linux/connector.h
+@@ -43,8 +43,10 @@
+ #define CN_IDX_DRBD			0x8
+ #define CN_VAL_DRBD			0x1
+ #define CN_KVP_IDX			0x9	/* HyperV KVP */
++#define CN_IDX_NFDBUS                   0xA     /* netfilter D-Bus */
++#define CN_VAL_NFDBUS                   0x1
+ 
+-#define CN_NETLINK_USERS		10	/* Highest index + 1 */
++#define CN_NETLINK_USERS		11	/* Highest index + 1 */
+ 
+ /*
+  * Maximum connector's message size.
+@@ -105,7 +107,7 @@ struct cn_callback_entry {
+ 	struct cn_queue_dev *pdev;
+ 
+ 	struct cn_callback_id id;
+-	void (*callback) (struct cn_msg *, struct netlink_skb_parms *);
++	void (*callback) (struct net *, struct cn_msg *, struct netlink_skb_parms *);
+ 
+ 	u32 seq, group;
+ };
+@@ -121,13 +123,14 @@ struct cn_dev {
+ };
+ 
+ int cn_add_callback(struct cb_id *id, const char *name,
+-		    void (*callback)(struct cn_msg *, struct netlink_skb_parms *));
++		    void (*callback)(struct net*, struct cn_msg *, struct netlink_skb_parms *));
+ void cn_del_callback(struct cb_id *);
+ int cn_netlink_send(struct cn_msg *, u32, gfp_t);
++int cn_netlink_reply(struct cn_msg *, u32, gfp_t);
+ 
+ int cn_queue_add_callback(struct cn_queue_dev *dev, const char *name,
+ 			  struct cb_id *id,
+-			  void (*callback)(struct cn_msg *, struct netlink_skb_parms *));
++			  void (*callback)(struct net*, struct cn_msg *, struct netlink_skb_parms *));
+ void cn_queue_del_callback(struct cn_queue_dev *dev, struct cb_id *id);
+ void cn_queue_release_callback(struct cn_callback_entry *);
+ 
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+index 857f502..982d286 100644
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -67,6 +67,7 @@ enum {
+ 	NFPROTO_BRIDGE =  7,
+ 	NFPROTO_IPV6   = 10,
+ 	NFPROTO_DECNET = 12,
++	NFPROTO_BUS,
+ 	NFPROTO_NUMPROTO,
+ };
+ 
+diff --git a/include/linux/security.h b/include/linux/security.h
+index 8ce59ef..64966874 100644
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@ -1573,6 +1573,7 @@ struct security_operations {
+ 
+ #ifdef CONFIG_SECURITY_NETWORK
+ 	int (*unix_stream_connect) (struct sock *sock, struct sock *other, struct sock *newsk);
++	int (*bus_stream_connect) (struct sock *sock, struct sock *other, struct sock *newsk);
+ 	int (*unix_may_send) (struct socket *sock, struct socket *other);
+ 
+ 	int (*socket_create) (int family, int type, int protocol, int kern);
+@@ -2543,6 +2544,7 @@ static inline int security_inode_getsecctx(struct inode *inode, void **ctx, u32
+ #ifdef CONFIG_SECURITY_NETWORK
+ 
+ int security_unix_stream_connect(struct sock *sock, struct sock *other, struct sock *newsk);
++int security_bus_stream_connect(struct sock *sock, struct sock *other, struct sock *newsk);
+ int security_unix_may_send(struct socket *sock,  struct socket *other);
+ int security_socket_create(int family, int type, int protocol, int kern);
+ int security_socket_post_create(struct socket *sock, int family,
+@@ -2590,6 +2592,13 @@ static inline int security_unix_stream_connect(struct sock *sock,
+ 	return 0;
+ }
+ 
++static inline int security_bus_stream_connect(struct socket *sock,
++					       struct sock *other,
++					       struct sock *newsk)
++{
++	return 0;
++}
++
+ static inline int security_unix_may_send(struct socket *sock,
+ 					 struct socket *other)
+ {
+diff --git a/include/linux/socket.h b/include/linux/socket.h
+index 4ef98e4..d93b669 100644
+--- a/include/linux/socket.h
++++ b/include/linux/socket.h
+@@ -192,7 +192,9 @@ struct ucred {
+ #define AF_IEEE802154	36	/* IEEE802154 sockets		*/
+ #define AF_CAIF		37	/* CAIF sockets			*/
+ #define AF_ALG		38	/* Algorithm sockets		*/
+-#define AF_MAX		39	/* For now.. */
++#define AF_NFC		39	/* NFC sockets 			*/
++#define AF_BUS          40      /* BUS sockets                  */
++#define AF_MAX          41      /* For now.. */
+ 
+ /* Protocol families, same as address families. */
+ #define PF_UNSPEC	AF_UNSPEC
+@@ -234,7 +236,9 @@ struct ucred {
+ #define PF_IEEE802154	AF_IEEE802154
+ #define PF_CAIF		AF_CAIF
+ #define PF_ALG		AF_ALG
+-#define PF_MAX		AF_MAX
++#define PF_NFC          AF_NFC
++#define PF_BUS          AF_BUS
++#define PF_MAX          AF_MAX
+ 
+ /* Maximum queue length specifiable by listen.  */
+ #define SOMAXCONN	128
+@@ -308,6 +312,7 @@ struct ucred {
+ #define SOL_IUCV	277
+ #define SOL_CAIF	278
+ #define SOL_ALG		279
++#define SOL_BUS		280
+ 
+ /* IPX options */
+ #define IPX_TYPE	1
+diff --git a/include/net/af_bus.h b/include/net/af_bus.h
+new file mode 100644
+index 0000000..8417833
+--- /dev/null
++++ b/include/net/af_bus.h
+@@ -0,0 +1,175 @@
++#ifndef __LINUX_NET_AFBUS_H
++#define __LINUX_NET_AFBUS_H
++
++#include <linux/socket.h>
++#include <linux/un.h>
++#include <linux/bus.h>
++#include <linux/mutex.h>
++#include <net/sock.h>
++
++extern void bus_inflight(struct file *fp);
++extern void bus_notinflight(struct file *fp);
++extern void bus_gc(void);
++extern void wait_for_bus_gc(void);
++extern struct sock *bus_get_socket(struct file *filp);
++extern struct sock *bus_peer_get(struct sock *);
++
++#define BUS_HASH_SIZE	256
++#define BUS_MASTER_ADDR 0x0
++#define BUS_PREFIX_BITS 16
++#define BUS_CLIENT_BITS 48
++#define BUS_PREFIX_MASK 0xffff000000000000
++#define BUS_CLIENT_MASK 0x0000ffffffffffff
++
++/* AF_BUS socket options */
++#define BUS_ADD_ADDR 1
++#define BUS_JOIN_BUS 2
++#define BUS_DEL_ADDR 3
++#define BUS_SET_EAVESDROP 4
++#define BUS_UNSET_EAVESDROP 5
++
++#define NF_BUS_SENDING 1
++
++/*
++ * AF_BUS ioctl() commands
++ *
++ * include/linux/sockios.h reserves 16 protocol private ioctl numbers
++ * from 0x89E0 to 89EF.
++ * So, let's use this range for the AF_BUS ioctl commands.
++ */
++#define SIOCSINQ 0x89E0
++
++extern unsigned int bus_tot_inflight;
++extern spinlock_t bus_table_lock;
++extern struct hlist_head bus_socket_table[BUS_HASH_SIZE + 1];
++
++struct bus_address {
++	atomic_t	refcnt;
++	int		len;
++	unsigned	hash;
++	struct hlist_node addr_node;
++	struct hlist_node table_node;
++	struct sock  *sock;
++	struct sockaddr_bus name[0];
++};
++
++
++struct bus_send_context {
++	struct socket *sender_socket;
++	struct sock_iocb *siocb;
++	long timeo;
++	int max_level;
++	int namelen;
++	unsigned hash;
++	struct sock *other;
++	struct sockaddr_bus	*sender;
++	struct sockaddr_bus	*recipient;
++	unsigned int		authenticated:1;
++	unsigned int		bus_master_side:1;
++	unsigned int		to_master:1;
++	unsigned int		multicast:1;
++	unsigned int            deliver:1;
++	unsigned int            eavesdropper:1;
++	unsigned int            main_recipient:1;
++};
++
++struct bus_skb_parms {
++	struct pid		*pid;		/* Skb credentials	*/
++	const struct cred	*cred;
++	struct scm_fp_list	*fp;		/* Passed files		*/
++#ifdef CONFIG_SECURITY_NETWORK
++	u32			secid;		/* Security ID		*/
++#endif
++	struct bus_send_context	*sendctx;
++};
++
++#define BUSCB(skb) 	(*(struct bus_skb_parms *)&((skb)->cb))
++#define BUSSID(skb)	(&BUSCB((skb)).secid)
++
++#define bus_state_lock(s)	spin_lock(&bus_sk(s)->lock)
++#define bus_state_unlock(s)	spin_unlock(&bus_sk(s)->lock)
++#define bus_state_lock_nested(s) \
++				spin_lock_nested(&bus_sk(s)->lock, \
++				SINGLE_DEPTH_NESTING)
++
++struct bus {
++	struct sock		*master;
++        /*
++	 * List of (struct bus_sock)->bus_node
++	 * Only sockets that were allowed to join the bus by the bus
++	 * master socket are members of this list.
++	 */
++	struct hlist_head       peers;
++	spinlock_t		lock;       /* protect the bus->peers list */
++	spinlock_t		send_lock;  /* enforce atomic mcast delivery */
++	struct kref             kref;
++	atomic64_t              addr_cnt;
++	atomic64_t              eavesdropper_cnt;
++};
++
++/* The AF_BUS socket */
++struct bus_sock {
++	/* WARNING: sk has to be the first member */
++	struct sock		sk;
++	struct bus_address     *addr;
++	struct hlist_head       addr_list;
++	struct path		path;
++	struct dentry		*dentry;
++	struct vfsmount		*mnt;
++	struct mutex		readlock;
++	struct sock		*peer;
++	struct sock		*other;
++	struct list_head	link;
++	atomic_long_t		inflight;
++	spinlock_t		lock;
++	unsigned int		gc_candidate : 1;
++	unsigned int		gc_maybe_cycle : 1;
++	unsigned char		recursion_level;
++	struct socket_wq	peer_wq;
++	struct bus              *bus;
++	bool                    bus_master;
++	bool                    bus_master_side;
++	bool                    authenticated;
++	bool                    eavesdropper;
++	struct hlist_node	bus_node;
++};
++#define bus_sk(__sk) ((struct bus_sock *)__sk)
++
++#define peer_wait peer_wq.wait
++
++static inline bool bus_same_bus(struct sockaddr_bus *sbusaddr1,
++				struct sockaddr_bus *sbusaddr2)
++{
++	int offset;
++
++	if (sbusaddr1->sbus_path[0] != sbusaddr2->sbus_path[0])
++		return false;
++
++	/*
++	 * abstract path names start with a null byte character,
++	 * so they have to be compared starting at the second char.
++	 */
++	offset = (sbusaddr1->sbus_path[0] == '\0');
++
++	return !strncmp(sbusaddr1->sbus_path + offset,
++		       sbusaddr2->sbus_path + offset,
++		       BUS_PATH_MAX);
++}
++
++long bus_inq_len(struct sock *sk);
++long bus_outq_len(struct sock *sk);
++
++#ifdef CONFIG_SYSCTL
++extern int bus_sysctl_register(struct net *net);
++extern void bus_sysctl_unregister(struct net *net);
++#else
++static inline int bus_sysctl_register(struct net *net) { return 0; }
++static inline void bus_sysctl_unregister(struct net *net) {}
++#endif
++
++bool bus_can_write(struct net *net,
++                   struct sockaddr_bus *addr,
++                   int len,
++                   int type,
++                   int protocol);
++#endif
+diff --git a/net/Kconfig b/net/Kconfig
+index 878151c..ca30fdb 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -47,6 +47,7 @@ menu "Networking options"
+ 
+ source "net/packet/Kconfig"
+ source "net/unix/Kconfig"
++source "net/bus/Kconfig"
+ source "net/xfrm/Kconfig"
+ source "net/iucv/Kconfig"
+ 
+diff --git a/net/Makefile b/net/Makefile
+index a51d946..c7ba809 100644
+--- a/net/Makefile
++++ b/net/Makefile
+@@ -19,6 +19,7 @@ obj-$(CONFIG_NETFILTER)		+= netfilter/
+ obj-$(CONFIG_INET)		+= ipv4/
+ obj-$(CONFIG_XFRM)		+= xfrm/
+ obj-$(CONFIG_UNIX)		+= unix/
++obj-$(CONFIG_BUS)		+= bus/
+ obj-$(CONFIG_NET)		+= ipv6/
+ obj-$(CONFIG_PACKET)		+= packet/
+ obj-$(CONFIG_NET_KEY)		+= key/
+diff --git a/net/bridge/br_netfilter.c b/net/bridge/br_netfilter.c
+index 3dc7f54..64387fe 100644
+--- a/net/bridge/br_netfilter.c
++++ b/net/bridge/br_netfilter.c
+@@ -734,10 +734,10 @@ static unsigned int br_nf_forward_ip(unsigned int hook, struct sk_buff *skb,
+ 
+ 	if (skb->protocol == htons(ETH_P_IP) || IS_VLAN_IP(skb) ||
+ 	    IS_PPPOE_IP(skb))
+-		pf = PF_INET;
++		pf = NFPROTO_IPV4;
+ 	else if (skb->protocol == htons(ETH_P_IPV6) || IS_VLAN_IPV6(skb) ||
+ 		 IS_PPPOE_IPV6(skb))
+-		pf = PF_INET6;
++		pf = NFPROTO_IPV6;
+ 	else
+ 		return NF_ACCEPT;
+ 
+@@ -749,13 +749,13 @@ static unsigned int br_nf_forward_ip(unsigned int hook, struct sk_buff *skb,
+ 		nf_bridge->mask |= BRNF_PKT_TYPE;
+ 	}
+ 
+-	if (pf == PF_INET && br_parse_ip_options(skb))
++	if (pf == NFPROTO_IPV4 && br_parse_ip_options(skb))
+ 		return NF_DROP;
+ 
+ 	/* The physdev module checks on this */
+ 	nf_bridge->mask |= BRNF_BRIDGED;
+ 	nf_bridge->physoutdev = skb->dev;
+-	if (pf == PF_INET)
++	if (pf == NFPROTO_IPV4)
+ 		skb->protocol = htons(ETH_P_IP);
+ 	else
+ 		skb->protocol = htons(ETH_P_IPV6);
+@@ -843,10 +843,10 @@ static unsigned int br_nf_post_routing(unsigned int hook, struct sk_buff *skb,
+ 
+ 	if (skb->protocol == htons(ETH_P_IP) || IS_VLAN_IP(skb) ||
+ 	    IS_PPPOE_IP(skb))
+-		pf = PF_INET;
++		pf = NFPROTO_IPV4;
+ 	else if (skb->protocol == htons(ETH_P_IPV6) || IS_VLAN_IPV6(skb) ||
+ 		 IS_PPPOE_IPV6(skb))
+-		pf = PF_INET6;
++		pf = NFPROTO_IPV6;
+ 	else
+ 		return NF_ACCEPT;
+ 
+@@ -859,7 +859,7 @@ static unsigned int br_nf_post_routing(unsigned int hook, struct sk_buff *skb,
+ 
+ 	nf_bridge_pull_encap_header(skb);
+ 	nf_bridge_save_header(skb);
+-	if (pf == PF_INET)
++	if (pf == NFPROTO_IPV4)
+ 		skb->protocol = htons(ETH_P_IP);
+ 	else
+ 		skb->protocol = htons(ETH_P_IPV6);
+@@ -892,49 +892,49 @@ static struct nf_hook_ops br_nf_ops[] __read_mostly = {
+ 	{
+ 		.hook = br_nf_pre_routing,
+ 		.owner = THIS_MODULE,
+-		.pf = PF_BRIDGE,
++		.pf = NFPROTO_BRIDGE,
+ 		.hooknum = NF_BR_PRE_ROUTING,
+ 		.priority = NF_BR_PRI_BRNF,
+ 	},
+ 	{
+ 		.hook = br_nf_local_in,
+ 		.owner = THIS_MODULE,
+-		.pf = PF_BRIDGE,
++		.pf = NFPROTO_BRIDGE,
+ 		.hooknum = NF_BR_LOCAL_IN,
+ 		.priority = NF_BR_PRI_BRNF,
+ 	},
+ 	{
+ 		.hook = br_nf_forward_ip,
+ 		.owner = THIS_MODULE,
+-		.pf = PF_BRIDGE,
++		.pf = NFPROTO_BRIDGE,
+ 		.hooknum = NF_BR_FORWARD,
+ 		.priority = NF_BR_PRI_BRNF - 1,
+ 	},
+ 	{
+ 		.hook = br_nf_forward_arp,
+ 		.owner = THIS_MODULE,
+-		.pf = PF_BRIDGE,
++		.pf = NFPROTO_BRIDGE,
+ 		.hooknum = NF_BR_FORWARD,
+ 		.priority = NF_BR_PRI_BRNF,
+ 	},
+ 	{
+ 		.hook = br_nf_post_routing,
+ 		.owner = THIS_MODULE,
+-		.pf = PF_BRIDGE,
++		.pf = NFPROTO_BRIDGE,
+ 		.hooknum = NF_BR_POST_ROUTING,
+ 		.priority = NF_BR_PRI_LAST,
+ 	},
+ 	{
+ 		.hook = ip_sabotage_in,
+ 		.owner = THIS_MODULE,
+-		.pf = PF_INET,
++		.pf = NFPROTO_IPV4,
+ 		.hooknum = NF_INET_PRE_ROUTING,
+ 		.priority = NF_IP_PRI_FIRST,
+ 	},
+ 	{
+ 		.hook = ip_sabotage_in,
+ 		.owner = THIS_MODULE,
+-		.pf = PF_INET6,
++		.pf = NFPROTO_IPV6,
+ 		.hooknum = NF_INET_PRE_ROUTING,
+ 		.priority = NF_IP6_PRI_FIRST,
+ 	},
+diff --git a/net/bus/Kconfig b/net/bus/Kconfig
+new file mode 100644
+index 0000000..628ae27
+--- /dev/null
++++ b/net/bus/Kconfig
+@@ -0,0 +1,14 @@
++#
++# Bus Domain Sockets
++#
++
++config BUS
++	tristate "Bus domain sockets"
++	---help---
++	  If you say Y here, you will include support for Bus domain sockets.
++	  These sockets are used to create communication buses for IPC.
++
++	  To compile this driver as a module, choose M here: the module will be
++	  called bus.
++
++	  Say Y unless you know what you are doing.
+diff --git a/net/bus/Makefile b/net/bus/Makefile
+new file mode 100644
+index 0000000..514d4fe
+--- /dev/null
++++ b/net/bus/Makefile
+@@ -0,0 +1,8 @@
++#
++# Makefile for the Linux unix domain socket layer.
++#
++
++obj-$(CONFIG_BUS)	+= bus.o
++
++bus-y			:= af_bus.o garbage.o
++bus-$(CONFIG_SYSCTL)	+= sysctl_net_bus.o
+diff --git a/net/bus/af_bus.c b/net/bus/af_bus.c
+new file mode 100644
+index 0000000..a3007af
+--- /dev/null
++++ b/net/bus/af_bus.c
+@@ -0,0 +1,2749 @@
++/*
++ * Implementation of Bus domain sockets.
++ *
++ * Copyright (c) 2012, Collabora, Ltd.
++ *
++ * Authors:	Javier Martinez Canillas, <javier.martinez@collabora.co.uk>
++ *              Alban Crequy, <alban.crequy@collabora.co.uk>
++ *
++ *		This program is free software; you can redistribute it and/or
++ *		modify it under the terms of the GNU General Public License
++ *		as published by the Free Software Foundation; either version
++ *		2 of the License, or (at your option) any later version.
++ *
++ * Based on BSD Unix domain sockets (net/unix).
++ */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/signal.h>
++#include <linux/sched.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <linux/stat.h>
++#include <linux/dcache.h>
++#include <linux/namei.h>
++#include <linux/socket.h>
++#include <linux/un.h>
++#include <linux/bus.h>
++#include <linux/fcntl.h>
++#include <linux/termios.h>
++#include <linux/sockios.h>
++#include <linux/net.h>
++#include <linux/in.h>
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <net/net_namespace.h>
++#include <net/sock.h>
++#include <net/tcp_states.h>
++#include <net/af_bus.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <net/scm.h>
++#include <linux/init.h>
++#include <linux/poll.h>
++#include <linux/rtnetlink.h>
++#include <linux/mount.h>
++#include <net/checksum.h>
++#include <linux/security.h>
++
++struct hlist_head bus_socket_table[BUS_HASH_SIZE + 1];
++EXPORT_SYMBOL_GPL(bus_socket_table);
++struct hlist_head bus_address_table[BUS_HASH_SIZE];
++DEFINE_SPINLOCK(bus_table_lock);
++DEFINE_SPINLOCK(bus_address_lock);
++static atomic_long_t bus_nr_socks;
++
++#define bus_sockets_unbound	(&bus_socket_table[BUS_HASH_SIZE])
++
++#define BUS_ABSTRACT(sk)	(bus_sk(sk)->addr->hash != BUS_HASH_SIZE)
++
++#ifdef CONFIG_SECURITY_NETWORK
++static void bus_get_secdata(struct scm_cookie *scm, struct sk_buff *skb)
++{
++	memcpy(BUSSID(skb), &scm->secid, sizeof(u32));
++}
++
++static inline void bus_set_secdata(struct scm_cookie *scm, struct sk_buff *skb)
++{
++	scm->secid = *BUSSID(skb);
++}
++#else
++static inline void bus_get_secdata(struct scm_cookie *scm, struct sk_buff *skb)
++{ }
++
++static inline void bus_set_secdata(struct scm_cookie *scm, struct sk_buff *skb)
++{ }
++#endif /* CONFIG_SECURITY_NETWORK */
++
++/*
++ *  SMP locking strategy:
++ *    bus_socket_table hash table is protected with spinlock bus_table_lock
++ *    bus_address_table hash table is protected with spinlock bus_address_lock
++ *    each bus is protected by a separate spin lock.
++ *    multicast atomic sending is protected by a separate spin lock.
++ *    each socket state is protected by a separate spin lock.
++ *    each socket address is protected by a separate spin lock.
++ *
++ *  When holding more than one lock, use the following hierarchy:
++ *  - bus_table_lock.
++ *  - bus_address_lock.
++ *  - socket lock.
++ *  - bus lock.
++ *  - bus send_lock.
++ *  - sock address lock.
++ */
++
++static inline unsigned int bus_hash_fold(__wsum n)
++{
++	unsigned int hash = (__force unsigned int)n;
++	hash ^= hash>>16;
++	hash ^= hash>>8;
++	return hash&(BUS_HASH_SIZE-1);
++}
++
++static inline unsigned int bus_compute_hash(struct bus_addr addr)
++{
++	return bus_hash_fold(csum_partial((void *)&addr, sizeof(addr), 0));
++}
++
++#define bus_peer(sk) (bus_sk(sk)->peer)
++
++static inline int bus_our_peer(struct sock *sk, struct sock *osk)
++{
++	return bus_peer(osk) == sk;
++}
++
++static inline int bus_recvq_full(struct sock const *sk)
++{
++	return skb_queue_len(&sk->sk_receive_queue) > sk->sk_max_ack_backlog;
++}
++
++static inline u16 bus_addr_prefix(struct sockaddr_bus *sbusaddr)
++{
++	return (sbusaddr->sbus_addr.s_addr & BUS_PREFIX_MASK) >> BUS_CLIENT_BITS;
++}
++
++static inline u64 bus_addr_client(struct sockaddr_bus *sbusaddr)
++{
++	return sbusaddr->sbus_addr.s_addr & BUS_CLIENT_MASK;
++}
++
++static inline bool bus_mc_addr(struct sockaddr_bus *sbusaddr)
++{
++	return bus_addr_client(sbusaddr) == BUS_CLIENT_MASK;
++}
++
++struct sock *bus_peer_get(struct sock *s)
++{
++	struct sock *peer;
++
++	bus_state_lock(s);
++	peer = bus_peer(s);
++	if (peer)
++		sock_hold(peer);
++	bus_state_unlock(s);
++	return peer;
++}
++EXPORT_SYMBOL_GPL(bus_peer_get);
++
++static inline void bus_release_addr(struct bus_address *addr)
++{
++	if (atomic_dec_and_test(&addr->refcnt))
++		kfree(addr);
++}
++
++/*
++ *	Check bus socket name:
++ *		- should be not zero length.
++ *	        - if started by not zero, should be NULL terminated (FS object)
++ *		- if started by zero, it is abstract name.
++ */
++
++static int bus_mkname(struct sockaddr_bus *sbusaddr, int len, unsigned int *hashp)
++{
++	int offset = (sbusaddr->sbus_path[0] == '\0');
++
++	if (len <= sizeof(short) || len > sizeof(*sbusaddr))
++		return -EINVAL;
++	if (!sbusaddr || sbusaddr->sbus_family != AF_BUS)
++		return -EINVAL;
++
++	len = strnlen(sbusaddr->sbus_path + offset, BUS_PATH_MAX) + 1 +
++		sizeof(sa_family_t) + sizeof(struct bus_addr);
++
++	*hashp = bus_compute_hash(sbusaddr->sbus_addr);
++	return len;
++}
++
++static void __bus_remove_address(struct bus_address *addr)
++{
++	hlist_del(&addr->table_node);
++}
++
++static void __bus_insert_address(struct hlist_head *list,
++				 struct bus_address *addr)
++{
++	hlist_add_head(&addr->table_node, list);
++}
++
++static inline void bus_remove_address(struct bus_address *addr)
++{
++	spin_lock(&bus_address_lock);
++	__bus_remove_address(addr);
++	spin_unlock(&bus_address_lock);
++}
++
++static inline void bus_insert_address(struct hlist_head *list,
++				      struct bus_address *addr)
++{
++	spin_lock(&bus_address_lock);
++	__bus_insert_address(list, addr);
++	spin_unlock(&bus_address_lock);
++}
++
++static void __bus_remove_socket(struct sock *sk)
++{
++	sk_del_node_init(sk);
++}
++
++static void __bus_insert_socket(struct hlist_head *list, struct sock *sk)
++{
++	WARN_ON(!sk_unhashed(sk));
++	sk_add_node(sk, list);
++}
++
++static inline void bus_remove_socket(struct sock *sk)
++{
++	spin_lock(&bus_table_lock);
++	__bus_remove_socket(sk);
++	spin_unlock(&bus_table_lock);
++}
++
++static inline void bus_insert_socket(struct hlist_head *list, struct sock *sk)
++{
++	spin_lock(&bus_table_lock);
++	__bus_insert_socket(list, sk);
++	spin_unlock(&bus_table_lock);
++}
++
++static inline bool __bus_has_prefix(struct sock *sk, u16 prefix)
++{
++	struct bus_sock *u = bus_sk(sk);
++	struct bus_address *addr;
++	struct hlist_node *node;
++	bool ret = false;
++
++	hlist_for_each_entry(addr, node, &u->addr_list, addr_node) {
++		if (bus_addr_prefix(addr->name) == prefix)
++			ret = true;
++	}
++
++	return ret;
++}
++
++static inline bool bus_has_prefix(struct sock *sk, u16 prefix)
++{
++	bool ret;
++
++	bus_state_lock(sk);
++	ret = __bus_has_prefix(sk, prefix);
++	bus_state_unlock(sk);
++
++	return ret;
++}
++
++static inline bool __bus_eavesdropper(struct sock *sk, u16 condition)
++{
++	struct bus_sock *u = bus_sk(sk);
++
++	return u->eavesdropper;
++}
++
++static inline bool bus_eavesdropper(struct sock *sk, u16 condition)
++{
++	bool ret;
++
++	bus_state_lock(sk);
++	ret = __bus_eavesdropper(sk, condition);
++	bus_state_unlock(sk);
++
++	return ret;
++}
++
++static inline bool bus_has_prefix_eavesdropper(struct sock *sk, u16 prefix)
++{
++	bool ret;
++
++	bus_state_lock(sk);
++	ret = __bus_has_prefix(sk, prefix) || __bus_eavesdropper(sk, 0);
++	bus_state_unlock(sk);
++
++	return ret;
++}
++
++static inline struct bus_address *__bus_get_address(struct sock *sk,
++						    struct bus_addr *sbus_addr)
++{
++	struct bus_sock *u = bus_sk(sk);
++	struct bus_address *addr = NULL;
++	struct hlist_node *node;
++
++	hlist_for_each_entry(addr, node, &u->addr_list, addr_node) {
++		if (addr->name->sbus_addr.s_addr == sbus_addr->s_addr)
++			goto found;
++	}
++
++found:
++	return addr;
++}
++
++static inline struct bus_address *bus_get_address(struct sock *sk,
++						  struct bus_addr *sbus_addr)
++{
++	struct bus_address *addr;
++
++	bus_state_lock(sk);
++	addr = __bus_get_address(sk, sbus_addr);
++	bus_state_unlock(sk);
++
++	return addr;
++}
++
++static struct sock *__bus_find_socket_byname(struct net *net,
++					      struct sockaddr_bus *sbusname,
++					      int len, int type, unsigned int hash)
++{
++	struct sock *s;
++	struct hlist_node *node;
++
++	sk_for_each(s, node, &bus_socket_table[hash ^ type]) {
++		struct bus_sock *u = bus_sk(s);
++
++		if (!net_eq(sock_net(s), net))
++			continue;
++
++		if (u->addr->len == len &&
++		    !memcmp(u->addr->name, sbusname, len))
++			goto found;
++	}
++	s = NULL;
++found:
++	return s;
++}
++
++static inline struct sock *bus_find_socket_byname(struct net *net,
++						  struct sockaddr_bus *sbusname,
++						  int len, int type,
++						  unsigned int hash)
++{
++	struct sock *s;
++
++	spin_lock(&bus_table_lock);
++	s = __bus_find_socket_byname(net, sbusname, len, type, hash);
++	if (s)
++		sock_hold(s);
++	spin_unlock(&bus_table_lock);
++	return s;
++}
++
++static struct sock *__bus_find_socket_byaddress(struct net *net,
++						struct sockaddr_bus *sbusname,
++						int len, int type, int protocol,
++						unsigned int hash)
++{
++	struct sock *s;
++	struct bus_address *addr;
++	struct hlist_node *node;
++	struct bus_sock *u;
++	int offset = (sbusname->sbus_path[0] == '\0');
++	int path_len = strnlen(sbusname->sbus_path + offset, BUS_PATH_MAX);
++
++	len = path_len + 1 + sizeof(sa_family_t) + sizeof(struct bus_addr);
++
++	hlist_for_each_entry(addr, node, &bus_address_table[hash],
++			     table_node) {
++		s = addr->sock;
++		u = bus_sk(s);
++
++		if (s->sk_protocol != protocol)
++			continue;
++
++		if (!net_eq(sock_net(s), net))
++			continue;
++
++		if (addr->len == len &&
++		    addr->name->sbus_family == sbusname->sbus_family &&
++		    addr->name->sbus_addr.s_addr == sbusname->sbus_addr.s_addr &&
++		    bus_same_bus(addr->name, sbusname))
++			goto found;
++	}
++	s = NULL;
++found:
++	return s;
++}
++
++static inline struct sock *bus_find_socket_byaddress(struct net *net,
++						     struct sockaddr_bus *sbusname,
++						     int len, int type,
++						     int protocol,
++						     unsigned int hash)
++{
++	struct sock *s;
++
++	spin_lock(&bus_address_lock);
++	s = __bus_find_socket_byaddress(net, sbusname, len, type, protocol, hash);
++	if (s)
++		sock_hold(s);
++	spin_unlock(&bus_address_lock);
++	return s;
++}
++
++bool bus_can_write(struct net *net,
++                   struct sockaddr_bus *sbusaddr,
++                   int len,
++                   int type,
++                   int protocol)
++{
++	struct sock *s;
++	unsigned int hash;
++	struct path path;
++	int err;
++
++	err = bus_mkname(sbusaddr, len, &hash);
++	if (err < 0)
++		return false;
++
++	if (sbusaddr->sbus_path[0]) {
++		struct inode *inode;
++		err = kern_path(sbusaddr->sbus_path, LOOKUP_FOLLOW, &path);
++		if (err)
++			return false;
++		inode = path.dentry->d_inode;
++		err = inode_permission(inode, MAY_WRITE);
++		if (err) {
++			path_put(&path);
++			return false;
++		}
++		if (!S_ISSOCK(inode->i_mode)) {
++			path_put(&path);
++			return false;
++		}
++
++		s = bus_find_socket_byaddress(net, sbusaddr, len, type, protocol, hash);
++		if (!s) {
++			path_put(&path);
++			return false;
++		}
++		sock_put(s);
++	} else {
++		s = bus_find_socket_byaddress(net, sbusaddr, len, type, protocol, hash);
++		if (!s)
++			return false;
++		sock_put(s);
++	}
++
++	return true;
++}
++
++static inline int bus_writable(struct sock *sk)
++{
++	return (atomic_read(&sk->sk_wmem_alloc) << 2) <= sk->sk_sndbuf;
++}
++
++static void bus_write_space(struct sock *sk)
++{
++	struct bus_sock *u = bus_sk(sk);
++	struct bus_sock *p;
++	struct hlist_node *node;
++	struct socket_wq *wq;
++
++	if (bus_writable(sk)) {
++		rcu_read_lock();
++		wq = rcu_dereference(sk->sk_wq);
++		if (wq_has_sleeper(wq))
++			wake_up_interruptible_sync_poll(&wq->wait,
++				POLLOUT | POLLWRNORM | POLLWRBAND);
++		sk_wake_async(sk, SOCK_WAKE_SPACE, POLL_OUT);
++		rcu_read_unlock();
++
++ 		if (u && u->bus) {
++			spin_lock(&u->bus->lock);
++			hlist_for_each_entry(p, node, &u->bus->peers, bus_node) {
++				if (!u->bus) {
++					BUG();
++				}
++				wake_up_interruptible_sync_poll(sk_sleep(&p->sk),
++								POLLOUT | POLLWRNORM |
++								POLLWRBAND);
++				sk_wake_async(&p->sk, SOCK_WAKE_SPACE, POLL_OUT);
++			}
++			spin_unlock(&u->bus->lock);
++		}
++	}
++}
++
++/* When dgram socket disconnects (or changes its peer), we clear its receive
++ * queue of packets arrived from previous peer. First, it allows to do
++ * flow control based only on wmem_alloc; second, sk connected to peer
++ * may receive messages only from that peer. */
++static void bus_dgram_disconnected(struct sock *sk, struct sock *other)
++{
++	if (!skb_queue_empty(&sk->sk_receive_queue)) {
++		skb_queue_purge(&sk->sk_receive_queue);
++		wake_up_interruptible_all(&bus_sk(sk)->peer_wait);
++
++		/* If one link of bidirectional dgram pipe is disconnected,
++		 * we signal error. Messages are lost. Do not make this,
++		 * when peer was not connected to us.
++		 */
++		if (!sock_flag(other, SOCK_DEAD) && bus_peer(other) == sk) {
++			other->sk_err = ECONNRESET;
++			other->sk_error_report(other);
++		}
++	}
++}
++
++static void bus_bus_release(struct kref *kref)
++{
++	struct bus *bus;
++
++	bus = container_of(kref, struct bus, kref);
++
++	kfree(bus);
++}
++
++static void bus_sock_destructor(struct sock *sk)
++{
++	struct bus_sock *u = bus_sk(sk);
++
++	skb_queue_purge(&sk->sk_receive_queue);
++
++	WARN_ON(atomic_read(&sk->sk_wmem_alloc));
++	WARN_ON(!sk_unhashed(sk));
++	WARN_ON(sk->sk_socket);
++	if (!sock_flag(sk, SOCK_DEAD)) {
++		printk(KERN_INFO "Attempt to release alive bus socket: %p\n", sk);
++		return;
++	}
++
++	if (u->bus) {
++		kref_put(&u->bus->kref, bus_bus_release);
++		u->bus = NULL;
++	}
++
++	atomic_long_dec(&bus_nr_socks);
++	local_bh_disable();
++	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
++	local_bh_enable();
++#ifdef BUS_REFCNT_DEBUG
++	printk(KERN_DEBUG "BUS %p is destroyed, %ld are still alive.\n", sk,
++		atomic_long_read(&bus_nr_socks));
++#endif
++}
++
++static int bus_release_sock(struct sock *sk, int embrion)
++{
++	struct bus_sock *u = bus_sk(sk);
++	struct path path;
++	struct sock *skpair;
++	struct sk_buff *skb;
++	int state;
++	struct bus_address *addr;
++	struct hlist_node *node, *tmp;
++
++	bus_remove_socket(sk);
++
++	if (u->bus && u->authenticated &&
++	    !u->bus_master && !u->bus_master_side) {
++		spin_lock(&u->bus->lock);
++		hlist_del(&u->bus_node);
++		if (u->eavesdropper)
++			atomic64_dec(&u->bus->eavesdropper_cnt);
++		spin_unlock(&u->bus->lock);
++	}
++
++	/* Clear state */
++	bus_state_lock(sk);
++	sock_orphan(sk);
++	sk->sk_shutdown = SHUTDOWN_MASK;
++	path	     = u->path;
++	u->path.dentry = NULL;
++	u->path.mnt = NULL;
++	state = sk->sk_state;
++	sk->sk_state = TCP_CLOSE;
++
++	if (u->bus_master)
++			u->bus->master = NULL;
++
++	if (u->bus_master_side) {
++		bus_release_addr(u->addr);
++		u->addr = NULL;
++	} else {
++		u->addr = NULL;
++
++		spin_lock(&bus_address_lock);
++		hlist_for_each_entry_safe(addr, node, tmp, &u->addr_list, addr_node) {
++			hlist_del(&addr->addr_node);
++			__bus_remove_address(addr);
++			bus_release_addr(addr);
++		}
++		spin_unlock(&bus_address_lock);
++	}
++
++	bus_state_unlock(sk);
++
++	wake_up_interruptible_all(&u->peer_wait);
++
++	skpair = bus_peer(sk);
++
++	if (skpair != NULL) {
++		if (sk->sk_type == SOCK_STREAM || sk->sk_type == SOCK_SEQPACKET) {
++			bus_state_lock(skpair);
++			/* No more writes */
++			skpair->sk_shutdown = SHUTDOWN_MASK;
++			if (!skb_queue_empty(&sk->sk_receive_queue) || embrion)
++				skpair->sk_err = ECONNRESET;
++			bus_state_unlock(skpair);
++			skpair->sk_state_change(skpair);
++			sk_wake_async(skpair, SOCK_WAKE_WAITD, POLL_HUP);
++		}
++		sock_put(skpair); /* It may now die */
++		bus_peer(sk) = NULL;
++	}
++
++	/* Try to flush out this socket. Throw out buffers at least */
++
++	while ((skb = skb_dequeue(&sk->sk_receive_queue)) != NULL) {
++		if (state == TCP_LISTEN)
++			bus_release_sock(skb->sk, 1);
++		/* passed fds are erased in the kfree_skb hook	      */
++		kfree_skb(skb);
++	}
++
++	if (path.dentry)
++		path_put(&path);
++
++	sock_put(sk);
++
++	/* ---- Socket is dead now and most probably destroyed ---- */
++
++	/*
++	 * Fixme: BSD difference: In BSD all sockets connected to use get
++	 *	  ECONNRESET and we die on the spot. In Linux we behave
++	 *	  like files and pipes do and wait for the last
++	 *	  dereference.
++	 *
++	 * Can't we simply set sock->err?
++	 *
++	 *	  What the above comment does talk about? --ANK(980817)
++	 */
++
++	if (bus_tot_inflight)
++		bus_gc();		/* Garbage collect fds */
++
++	return 0;
++}
++
++static void init_peercred(struct sock *sk)
++{
++	put_pid(sk->sk_peer_pid);
++	if (sk->sk_peer_cred)
++		put_cred(sk->sk_peer_cred);
++	sk->sk_peer_pid  = get_pid(task_tgid(current));
++	sk->sk_peer_cred = get_current_cred();
++}
++
++static void copy_peercred(struct sock *sk, struct sock *peersk)
++{
++	put_pid(sk->sk_peer_pid);
++	if (sk->sk_peer_cred)
++		put_cred(sk->sk_peer_cred);
++	sk->sk_peer_pid  = get_pid(peersk->sk_peer_pid);
++	sk->sk_peer_cred = get_cred(peersk->sk_peer_cred);
++}
++
++static int bus_listen(struct socket *sock, int backlog)
++{
++	int err;
++	struct sock *sk = sock->sk;
++	struct bus_sock *u = bus_sk(sk);
++	struct pid *old_pid = NULL;
++	const struct cred *old_cred = NULL;
++
++	err = -EOPNOTSUPP;
++	if (sock->type != SOCK_STREAM && sock->type != SOCK_SEQPACKET)
++		goto out;	/* Only stream/seqpacket sockets accept */
++	err = -EINVAL;
++	if (!u->addr || !u->bus_master)
++		goto out;	/* Only listens on an bound an master socket */
++	bus_state_lock(sk);
++	if (sk->sk_state != TCP_CLOSE && sk->sk_state != TCP_LISTEN)
++		goto out_unlock;
++	if (backlog > sk->sk_max_ack_backlog)
++		wake_up_interruptible_all(&u->peer_wait);
++	sk->sk_max_ack_backlog	= backlog;
++	sk->sk_state		= TCP_LISTEN;
++	/* set credentials so connect can copy them */
++	init_peercred(sk);
++	err = 0;
++
++out_unlock:
++	bus_state_unlock(sk);
++	put_pid(old_pid);
++	if (old_cred)
++		put_cred(old_cred);
++out:
++	return err;
++}
++
++static int bus_release(struct socket *);
++static int bus_bind(struct socket *, struct sockaddr *, int);
++static int bus_stream_connect(struct socket *, struct sockaddr *,
++			       int addr_len, int flags);
++static int bus_accept(struct socket *, struct socket *, int);
++static int bus_getname(struct socket *, struct sockaddr *, int *, int);
++static unsigned int bus_dgram_poll(struct file *, struct socket *,
++				    poll_table *);
++static int bus_ioctl(struct socket *, unsigned int, unsigned long);
++static int bus_shutdown(struct socket *, int);
++static int bus_setsockopt(struct socket *, int, int, char __user *,
++			   unsigned int);
++static int bus_dgram_sendmsg(struct kiocb *, struct socket *,
++			      struct msghdr *, size_t);
++static int bus_dgram_recvmsg(struct kiocb *, struct socket *,
++			      struct msghdr *, size_t, int);
++static int bus_seqpacket_sendmsg(struct kiocb *, struct socket *,
++				  struct msghdr *, size_t);
++static int bus_seqpacket_recvmsg(struct kiocb *, struct socket *,
++				  struct msghdr *, size_t, int);
++
++static const struct proto_ops bus_seqpacket_ops = {
++	.family =	PF_BUS,
++	.owner =	THIS_MODULE,
++	.release =	bus_release,
++	.bind =		bus_bind,
++	.connect =	bus_stream_connect,
++	.socketpair =	sock_no_socketpair,
++	.accept =	bus_accept,
++	.getname =	bus_getname,
++	.poll =		bus_dgram_poll,
++	.ioctl =	bus_ioctl,
++	.listen =	bus_listen,
++	.shutdown =	bus_shutdown,
++	.setsockopt =	bus_setsockopt,
++	.getsockopt =	sock_no_getsockopt,
++	.sendmsg =	bus_seqpacket_sendmsg,
++	.recvmsg =	bus_seqpacket_recvmsg,
++	.mmap =		sock_no_mmap,
++	.sendpage =	sock_no_sendpage,
++};
++
++static struct proto bus_proto = {
++	.name			= "BUS",
++	.owner			= THIS_MODULE,
++	.obj_size		= sizeof(struct bus_sock),
++};
++
++/*
++ * AF_BUS sockets do not interact with hardware, hence they
++ * dont trigger interrupts - so it's safe for them to have
++ * bh-unsafe locking for their sk_receive_queue.lock. Split off
++ * this special lock-class by reinitializing the spinlock key:
++ */
++static struct lock_class_key af_bus_sk_receive_queue_lock_key;
++
++static struct sock *bus_create1(struct net *net, struct socket *sock)
++{
++	struct sock *sk = NULL;
++	struct bus_sock *u;
++
++	atomic_long_inc(&bus_nr_socks);
++	if (atomic_long_read(&bus_nr_socks) > 2 * get_max_files())
++		goto out;
++
++	sk = sk_alloc(net, PF_BUS, GFP_KERNEL, &bus_proto);
++	if (!sk)
++		goto out;
++
++	sock_init_data(sock, sk);
++	lockdep_set_class(&sk->sk_receive_queue.lock,
++				&af_bus_sk_receive_queue_lock_key);
++
++	sk->sk_write_space	= bus_write_space;
++	sk->sk_max_ack_backlog	= net->unx.sysctl_max_dgram_qlen;
++	sk->sk_destruct		= bus_sock_destructor;
++	u	  = bus_sk(sk);
++	u->path.dentry = NULL;
++	u->path.mnt = NULL;
++	u->bus = NULL;
++	u->bus_master = false;
++	u->authenticated = false;
++	u->eavesdropper = false;
++	spin_lock_init(&u->lock);
++	atomic_long_set(&u->inflight, 0);
++	INIT_LIST_HEAD(&u->link);
++	INIT_HLIST_HEAD(&u->addr_list);
++	INIT_HLIST_NODE(&u->bus_node);
++	mutex_init(&u->readlock); /* single task reading lock */
++	init_waitqueue_head(&u->peer_wait);
++	bus_insert_socket(bus_sockets_unbound, sk);
++out:
++	if (sk == NULL)
++		atomic_long_dec(&bus_nr_socks);
++	else {
++		local_bh_disable();
++		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
++		local_bh_enable();
++	}
++	return sk;
++}
++
++static int bus_create(struct net *net, struct socket *sock, int protocol,
++		       int kern)
++{
++	struct sock *sk;
++
++	if (protocol < BUS_PROTO_NONE || protocol > BUS_PROTO_DBUS)
++		return -EPROTONOSUPPORT;
++
++	if (protocol != BUS_PROTO_NONE)
++		request_module("net-pf-%d-proto-%d", PF_BUS, protocol);
++
++	sock->state = SS_UNCONNECTED;
++
++	if (sock->type == SOCK_SEQPACKET)
++		sock->ops = &bus_seqpacket_ops;
++	else
++		return -ESOCKTNOSUPPORT;
++
++	sk = bus_create1(net, sock);
++	if (!sk)
++		return -ENOMEM;
++
++	sk->sk_protocol = protocol;
++
++	return 0;
++}
++
++static int bus_release(struct socket *sock)
++{
++	struct sock *sk = sock->sk;
++
++	if (!sk)
++		return 0;
++
++	sock->sk = NULL;
++
++	return bus_release_sock(sk, 0);
++}
++
++static struct sock *bus_find_other(struct net *net,
++				   struct sockaddr_bus *sbusname, int len,
++				   int type, int protocol, unsigned int hash,
++				   int *error)
++{
++	struct sock *u;
++	struct path path;
++	int err = 0;
++
++	if (sbusname->sbus_path[0]) {
++		struct inode *inode;
++		err = kern_path(sbusname->sbus_path, LOOKUP_FOLLOW, &path);
++		if (err)
++			goto fail;
++		inode = path.dentry->d_inode;
++		err = inode_permission(inode, MAY_WRITE);
++		if (err)
++			goto put_fail;
++
++		err = -ECONNREFUSED;
++		if (!S_ISSOCK(inode->i_mode))
++			goto put_fail;
++		u = bus_find_socket_byaddress(net, sbusname, len, type,
++					      protocol, hash);
++		if (!u)
++			goto put_fail;
++
++		if (u->sk_type == type)
++			touch_atime(path.mnt, path.dentry);
++
++		path_put(&path);
++
++		err = -EPROTOTYPE;
++		if (u->sk_type != type) {
++			sock_put(u);
++			goto fail;
++		}
++	} else {
++		err = -ECONNREFUSED;
++		u = bus_find_socket_byaddress(net, sbusname, len, type,
++					      protocol, hash);
++		if (u) {
++			struct dentry *dentry;
++			dentry = bus_sk(u)->path.dentry;
++			if (dentry)
++				touch_atime(bus_sk(u)->mnt, dentry);
++		} else
++			goto fail;
++	}
++
++	return u;
++
++put_fail:
++	path_put(&path);
++fail:
++	*error = err;
++	return NULL;
++}
++
++
++static int bus_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
++{
++	struct sock *sk = sock->sk;
++	struct net *net = sock_net(sk);
++	struct bus_sock *u = bus_sk(sk);
++	struct sockaddr_bus *sbusaddr = (struct sockaddr_bus *)uaddr;
++	struct dentry *dentry = NULL;
++	struct nameidata nd;
++	int err;
++	unsigned int hash;
++	struct bus_address *addr;
++	struct hlist_head *list;
++	struct bus *bus;
++
++	err = -EINVAL;
++	if (sbusaddr->sbus_family != AF_BUS)
++		goto out;
++
++	/* If the address is available, the socket is the bus master */
++	sbusaddr->sbus_addr.s_addr = BUS_MASTER_ADDR;
++
++	err = bus_mkname(sbusaddr, addr_len, &hash);
++	if (err < 0)
++		goto out;
++	addr_len = err;
++
++	mutex_lock(&u->readlock);
++
++	err = -EINVAL;
++	if (u->addr)
++		goto out_up;
++
++	err = -ENOMEM;
++	addr = kzalloc(sizeof(*addr) + sizeof(struct sockaddr_bus), GFP_KERNEL);
++	if (!addr)
++		goto out_up;
++
++	memcpy(addr->name, sbusaddr, sizeof(struct sockaddr_bus));
++	addr->len = addr_len;
++	addr->hash = hash;
++	atomic_set(&addr->refcnt, 1);
++	addr->sock = sk;
++	INIT_HLIST_NODE(&addr->addr_node);
++	INIT_HLIST_NODE(&addr->table_node);
++
++	if (sbusaddr->sbus_path[0]) {
++		umode_t mode;
++		err = 0;
++		/*
++		 * Get the parent directory, calculate the hash for last
++		 * component.
++		 */
++		err = kern_path_parent(sbusaddr->sbus_path, &nd);
++		if (err)
++			goto out_mknod_parent;
++
++		dentry = lookup_create(&nd, 0);
++		err = PTR_ERR(dentry);
++		if (IS_ERR(dentry))
++			goto out_mknod_unlock;
++
++		/*
++		 * All right, let's create it.
++		 */
++		mode = S_IFSOCK |
++		       (SOCK_INODE(sock)->i_mode & ~current_umask());
++		err = mnt_want_write(nd.path.mnt);
++		if (err)
++			goto out_mknod_dput;
++		err = security_path_mknod(&nd.path, dentry, mode, 0);
++		if (err)
++			goto out_mknod_drop_write;
++		err = vfs_mknod(nd.path.dentry->d_inode, dentry, mode, 0);
++out_mknod_drop_write:
++		mnt_drop_write(nd.path.mnt);
++		if (err)
++			goto out_mknod_dput;
++		mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++		dput(nd.path.dentry);
++		nd.path.dentry = dentry;
++	}
++
++	err = -ENOMEM;
++	bus = kzalloc(sizeof(*bus), GFP_KERNEL);
++	if (!bus)
++		goto out_unlock;
++
++	spin_lock(&bus_table_lock);
++
++	if (!sbusaddr->sbus_path[0]) {
++		err = -EADDRINUSE;
++		if (__bus_find_socket_byname(net, sbusaddr, addr_len,
++					     sk->sk_type, hash)) {
++			bus_release_addr(addr);
++			kfree(bus);
++			goto out_unlock;
++		}
++
++		list = &bus_socket_table[addr->hash];
++	} else {
++		list = &bus_socket_table[dentry->d_inode->i_ino &
++					 (BUS_HASH_SIZE-1)];
++		u->dentry = nd.path.dentry;
++		u->mnt    = nd.path.mnt;
++	}
++
++	kref_init(&bus->kref);
++	bus->master = sk;
++	INIT_HLIST_HEAD(&bus->peers);
++	spin_lock_init(&bus->lock);
++	spin_lock_init(&bus->send_lock);
++	atomic64_set(&bus->addr_cnt, 0);
++	atomic64_set(&bus->eavesdropper_cnt, 0);
++
++	hlist_add_head(&addr->addr_node, &u->addr_list);
++
++	err = 0;
++	__bus_remove_socket(sk);
++	u->addr = addr;
++	u->bus_master = true;
++	u->bus = bus;
++	__bus_insert_socket(list, sk);
++	bus_insert_address(&bus_address_table[addr->hash], addr);
++
++out_unlock:
++	spin_unlock(&bus_table_lock);
++out_up:
++	mutex_unlock(&u->readlock);
++out:
++	return err;
++
++out_mknod_dput:
++	dput(dentry);
++out_mknod_unlock:
++	mutex_unlock(&nd.path.dentry->d_inode->i_mutex);
++	path_put(&nd.path);
++out_mknod_parent:
++	if (err == -EEXIST)
++		err = -EADDRINUSE;
++	bus_release_addr(addr);
++	goto out_up;
++}
++
++static long bus_wait_for_peer(struct sock *other, long timeo)
++{
++	struct bus_sock *u = bus_sk(other);
++	int sched;
++	DEFINE_WAIT(wait);
++
++	prepare_to_wait_exclusive(&u->peer_wait, &wait, TASK_INTERRUPTIBLE);
++
++	sched = !sock_flag(other, SOCK_DEAD) &&
++		!(other->sk_shutdown & RCV_SHUTDOWN) &&
++		bus_recvq_full(other);
++
++	bus_state_unlock(other);
++
++	if (sched)
++		timeo = schedule_timeout(timeo);
++
++	finish_wait(&u->peer_wait, &wait);
++	return timeo;
++}
++
++static int bus_stream_connect(struct socket *sock, struct sockaddr *uaddr,
++			       int addr_len, int flags)
++{
++	struct sockaddr_bus *sbusaddr = (struct sockaddr_bus *)uaddr;
++	struct sock *sk = sock->sk;
++	struct net *net = sock_net(sk);
++	struct bus_sock *u = bus_sk(sk), *newu, *otheru;
++	struct sock *newsk = NULL;
++	struct sock *other = NULL;
++	struct sk_buff *skb = NULL;
++	struct bus_address *addr = NULL;
++	unsigned int hash;
++	int st;
++	int err;
++	long timeo;
++
++	/* Only connect to the bus master is allowed */
++	sbusaddr->sbus_addr.s_addr = BUS_MASTER_ADDR;
++
++	err = bus_mkname(sbusaddr, addr_len, &hash);
++	if (err < 0)
++		goto out;
++	addr_len = err;
++
++	err = -ENOMEM;
++	addr = kzalloc(sizeof(*addr) + sizeof(struct sockaddr_bus), GFP_KERNEL);
++	if (!addr)
++		goto out;
++
++	atomic_set(&addr->refcnt, 1);
++	INIT_HLIST_NODE(&addr->addr_node);
++	INIT_HLIST_NODE(&addr->table_node);
++
++	timeo = sock_sndtimeo(sk, flags & O_NONBLOCK);
++
++	/* First of all allocate resources.
++	   If we will make it after state is locked,
++	   we will have to recheck all again in any case.
++	 */
++
++	err = -ENOMEM;
++
++	/* create new sock for complete connection */
++	newsk = bus_create1(sock_net(sk), NULL);
++	if (newsk == NULL)
++		goto out;
++
++	/* Allocate skb for sending to listening sock */
++	skb = sock_wmalloc(newsk, 1, 0, GFP_KERNEL);
++	if (skb == NULL)
++		goto out;
++
++restart:
++	/*  Find listening sock. */
++	other = bus_find_other(net, sbusaddr, addr_len, sk->sk_type,
++			       sk->sk_protocol, hash, &err);
++	if (!other)
++		goto out;
++
++	/* Latch state of peer */
++	bus_state_lock(other);
++
++	/* Apparently VFS overslept socket death. Retry. */
++	if (sock_flag(other, SOCK_DEAD)) {
++		bus_state_unlock(other);
++		sock_put(other);
++		goto restart;
++	}
++
++	err = -ECONNREFUSED;
++	if (other->sk_state != TCP_LISTEN)
++		goto out_unlock;
++	if (other->sk_shutdown & RCV_SHUTDOWN)
++		goto out_unlock;
++
++	if (bus_recvq_full(other)) {
++		err = -EAGAIN;
++		if (!timeo)
++			goto out_unlock;
++
++		timeo = bus_wait_for_peer(other, timeo);
++
++		err = sock_intr_errno(timeo);
++		if (signal_pending(current))
++			goto out;
++		sock_put(other);
++		goto restart;
++	}
++
++	/* Latch our state.
++
++	   It is tricky place. We need to grab our state lock and cannot
++	   drop lock on peer. It is dangerous because deadlock is
++	   possible. Connect to self case and simultaneous
++	   attempt to connect are eliminated by checking socket
++	   state. other is TCP_LISTEN, if sk is TCP_LISTEN we
++	   check this before attempt to grab lock.
++
++	   Well, and we have to recheck the state after socket locked.
++	 */
++	st = sk->sk_state;
++
++	switch (st) {
++	case TCP_CLOSE:
++		/* This is ok... continue with connect */
++		break;
++	case TCP_ESTABLISHED:
++		/* Socket is already connected */
++		err = -EISCONN;
++		goto out_unlock;
++	default:
++		err = -EINVAL;
++		goto out_unlock;
++	}
++
++	bus_state_lock_nested(sk);
++
++	if (sk->sk_state != st) {
++		bus_state_unlock(sk);
++		bus_state_unlock(other);
++		sock_put(other);
++		goto restart;
++	}
++
++	err = security_bus_stream_connect(sk, other, newsk);
++	if (err) {
++		bus_state_unlock(sk);
++		goto out_unlock;
++	}
++
++	/* The way is open! Fastly set all the necessary fields... */
++
++	sock_hold(sk);
++	bus_peer(newsk)	= sk;
++	newsk->sk_state		= TCP_ESTABLISHED;
++	newsk->sk_type		= sk->sk_type;
++	newsk->sk_protocol	= sk->sk_protocol;
++	init_peercred(newsk);
++	newu = bus_sk(newsk);
++	RCU_INIT_POINTER(newsk->sk_wq, &newu->peer_wq);
++	otheru = bus_sk(other);
++
++	/* copy address information from listening to new sock*/
++	if (otheru->addr && otheru->bus_master) {
++		atomic_inc(&otheru->addr->refcnt);
++		newu->addr = otheru->addr;
++		memcpy(addr->name, otheru->addr->name,
++		       sizeof(struct sockaddr_bus));
++		addr->len = otheru->addr->len;
++		addr->name->sbus_addr.s_addr =
++			(atomic64_inc_return(&otheru->bus->addr_cnt) &
++			 BUS_CLIENT_MASK);
++		addr->hash = bus_compute_hash(addr->name->sbus_addr);
++		addr->sock = sk;
++		u->addr = addr;
++		kref_get(&otheru->bus->kref);
++		u->bus = otheru->bus;
++		u->bus_master_side = false;
++		kref_get(&otheru->bus->kref);
++		newu->bus = otheru->bus;
++		newu->bus_master_side = true;
++		hlist_add_head(&addr->addr_node, &u->addr_list);
++
++		bus_insert_address(&bus_address_table[addr->hash], addr);
++	}
++	if (otheru->path.dentry) {
++		path_get(&otheru->path);
++		newu->path = otheru->path;
++	}
++
++	/* Set credentials */
++	copy_peercred(sk, other);
++	sk->sk_sndbuf = other->sk_sndbuf;
++	newsk->sk_sndbuf = other->sk_sndbuf;
++
++	sock->state	= SS_CONNECTED;
++	sk->sk_state	= TCP_ESTABLISHED;
++	sock_hold(newsk);
++
++	smp_mb__after_atomic_inc();	/* sock_hold() does an atomic_inc() */
++	bus_peer(sk)	= newsk;
++
++	bus_state_unlock(sk);
++
++	/* take ten and and send info to listening sock */
++	spin_lock(&other->sk_receive_queue.lock);
++	__skb_queue_tail(&other->sk_receive_queue, skb);
++	spin_unlock(&other->sk_receive_queue.lock);
++	bus_state_unlock(other);
++	other->sk_data_ready(other, 0);
++	sock_put(other);
++	return 0;
++
++out_unlock:
++	if (other)
++		bus_state_unlock(other);
++
++out:
++	kfree_skb(skb);
++	if (addr)
++		bus_release_addr(addr);
++	if (newsk)
++		bus_release_sock(newsk, 0);
++	if (other)
++		sock_put(other);
++	return err;
++}
++
++static int bus_accept(struct socket *sock, struct socket *newsock, int flags)
++{
++	struct sock *sk = sock->sk;
++	struct sock *tsk;
++	struct sk_buff *skb;
++	int err;
++
++	err = -EOPNOTSUPP;
++	if (sock->type != SOCK_STREAM && sock->type != SOCK_SEQPACKET)
++		goto out;
++
++	err = -EINVAL;
++	if (sk->sk_state != TCP_LISTEN)
++		goto out;
++
++	/* If socket state is TCP_LISTEN it cannot change (for now...),
++	 * so that no locks are necessary.
++	 */
++
++	skb = skb_recv_datagram(sk, 0, flags&O_NONBLOCK, &err);
++	if (!skb) {
++		/* This means receive shutdown. */
++		if (err == 0)
++			err = -EINVAL;
++		goto out;
++	}
++
++	tsk = skb->sk;
++	skb_free_datagram(sk, skb);
++	wake_up_interruptible(&bus_sk(sk)->peer_wait);
++
++	/* attach accepted sock to socket */
++	bus_state_lock(tsk);
++	newsock->state = SS_CONNECTED;
++	sock_graft(tsk, newsock);
++	bus_state_unlock(tsk);
++	return 0;
++
++out:
++	return err;
++}
++
++
++static int bus_getname(struct socket *sock, struct sockaddr *uaddr,
++		       int *uaddr_len, int peer)
++{
++	struct sock *sk = sock->sk;
++	struct bus_sock *u;
++	DECLARE_SOCKADDR(struct sockaddr_bus *, sbusaddr, uaddr);
++	int err = 0;
++
++	if (peer) {
++		sk = bus_peer_get(sk);
++
++		err = -ENOTCONN;
++		if (!sk)
++			goto out;
++		err = 0;
++	} else {
++		sock_hold(sk);
++	}
++
++	u = bus_sk(sk);
++
++	bus_state_lock(sk);
++	if (!u->addr) {
++		sbusaddr->sbus_family = AF_BUS;
++		sbusaddr->sbus_path[0] = 0;
++		*uaddr_len = sizeof(short);
++	} else {
++		struct bus_address *addr = u->addr;
++
++		*uaddr_len = sizeof(struct sockaddr_bus);
++		memcpy(sbusaddr, addr->name, *uaddr_len);
++	}
++	bus_state_unlock(sk);
++	sock_put(sk);
++out:
++	return err;
++}
++
++static void bus_detach_fds(struct scm_cookie *scm, struct sk_buff *skb)
++{
++	int i;
++
++	scm->fp = BUSCB(skb).fp;
++	BUSCB(skb).fp = NULL;
++
++	for (i = scm->fp->count-1; i >= 0; i--)
++		bus_notinflight(scm->fp->fp[i]);
++}
++
++static void bus_destruct_scm(struct sk_buff *skb)
++{
++	struct scm_cookie scm;
++	memset(&scm, 0, sizeof(scm));
++	scm.pid  = BUSCB(skb).pid;
++	scm.cred = BUSCB(skb).cred;
++	if (BUSCB(skb).fp)
++		bus_detach_fds(&scm, skb);
++
++	/* Alas, it calls VFS */
++	/* So fscking what? fput() had been SMP-safe since the last Summer */
++	scm_destroy(&scm);
++	if (skb->sk)
++		sock_wfree(skb);
++}
++
++#define MAX_RECURSION_LEVEL 4
++
++static int bus_attach_fds(struct scm_cookie *scm, struct sk_buff *skb)
++{
++	int i;
++	unsigned char max_level = 0;
++	int bus_sock_count = 0;
++
++	for (i = scm->fp->count - 1; i >= 0; i--) {
++		struct sock *sk = bus_get_socket(scm->fp->fp[i]);
++
++		if (sk) {
++			bus_sock_count++;
++			max_level = max(max_level,
++					bus_sk(sk)->recursion_level);
++		}
++	}
++	if (unlikely(max_level > MAX_RECURSION_LEVEL))
++		return -ETOOMANYREFS;
++
++	/*
++	 * Need to duplicate file references for the sake of garbage
++	 * collection.  Otherwise a socket in the fps might become a
++	 * candidate for GC while the skb is not yet queued.
++	 */
++	BUSCB(skb).fp = scm_fp_dup(scm->fp);
++	if (!BUSCB(skb).fp)
++		return -ENOMEM;
++
++	if (bus_sock_count) {
++		for (i = scm->fp->count - 1; i >= 0; i--)
++			bus_inflight(scm->fp->fp[i]);
++	}
++	return max_level;
++}
++
++static int bus_scm_to_skb(struct scm_cookie *scm, struct sk_buff *skb,
++			  bool send_fds)
++{
++	int err = 0;
++
++	BUSCB(skb).pid  = get_pid(scm->pid);
++	if (scm->cred)
++		BUSCB(skb).cred = get_cred(scm->cred);
++	BUSCB(skb).fp = NULL;
++	if (scm->fp && send_fds)
++		err = bus_attach_fds(scm, skb);
++
++	skb->destructor = bus_destruct_scm;
++	return err;
++}
++
++/*
++ * Some apps rely on write() giving SCM_CREDENTIALS
++ * We include credentials if source or destination socket
++ * asserted SOCK_PASSCRED.
++ */
++static void maybe_add_creds(struct sk_buff *skb, const struct socket *sock,
++			    const struct sock *other)
++{
++	if (BUSCB(skb).cred)
++		return;
++	if (test_bit(SOCK_PASSCRED, &sock->flags) ||
++	    !other->sk_socket ||
++	    test_bit(SOCK_PASSCRED, &other->sk_socket->flags)) {
++		BUSCB(skb).pid  = get_pid(task_tgid(current));
++		BUSCB(skb).cred = get_current_cred();
++	}
++}
++
++/*
++ *	Send AF_BUS data.
++ */
++
++static void bus_deliver_skb(struct sk_buff *skb)
++{
++	struct bus_send_context *sendctx = BUSCB(skb).sendctx;
++	struct socket *sock = sendctx->sender_socket;
++
++	if (sock_flag(sendctx->other, SOCK_RCVTSTAMP))
++		__net_timestamp(skb);
++	maybe_add_creds(skb, sock, sendctx->other);
++	skb_queue_tail(&sendctx->other->sk_receive_queue, skb);
++	if (sendctx->max_level > bus_sk(sendctx->other)->recursion_level)
++		bus_sk(sendctx->other)->recursion_level = sendctx->max_level;
++}
++
++static int bus_dgram_sendmsg_finish(struct sk_buff *skb)
++{
++	int err;
++	struct bus_send_context *sendctx;
++	struct socket *sock;
++	struct sock *sk;
++	struct net *net;
++	size_t len = skb->len;
++
++	sendctx = BUSCB(skb).sendctx;
++	sock = sendctx->sender_socket;
++	sk = sock->sk;
++	net = sock_net(sk);
++
++restart:
++	if (!sendctx->other) {
++		err = -ECONNRESET;
++		if (sendctx->recipient == NULL)
++			goto out_free;
++
++		sendctx->other = bus_find_other(net, sendctx->recipient,
++						sendctx->namelen, sk->sk_type,
++						sk->sk_protocol,
++						sendctx->hash, &err);
++
++		if (sendctx->other == NULL ||
++		    !bus_sk(sendctx->other)->authenticated) {
++
++			if (sendctx->other)
++				sock_put(sendctx->other);
++
++			if (!bus_sk(sk)->bus_master_side) {
++				err = -ENOTCONN;
++				sendctx->other = bus_peer_get(sk);
++				if (!sendctx->other)
++					goto out_free;
++			} else {
++				sendctx->other = sk;
++				sock_hold(sendctx->other);
++			}
++		}
++	}
++
++	if (sk_filter(sendctx->other, skb) < 0) {
++		/* Toss the packet but do not return any error to the sender */
++		err = len;
++		goto out_free;
++	}
++
++	bus_state_lock(sendctx->other);
++
++	if (sock_flag(sendctx->other, SOCK_DEAD)) {
++		/*
++		 *	Check with 1003.1g - what should
++		 *	datagram error
++		 */
++		bus_state_unlock(sendctx->other);
++		sock_put(sendctx->other);
++
++		err = 0;
++		bus_state_lock(sk);
++		if (bus_peer(sk) == sendctx->other) {
++			bus_peer(sk) = NULL;
++			bus_state_unlock(sk);
++
++			bus_dgram_disconnected(sk, sendctx->other);
++			sock_put(sendctx->other);
++			err = -ECONNREFUSED;
++		} else {
++			bus_state_unlock(sk);
++		}
++
++		sendctx->other = NULL;
++		if (err)
++			goto out_free;
++		goto restart;
++	}
++
++	err = -EPIPE;
++	if (sendctx->other->sk_shutdown & RCV_SHUTDOWN)
++		goto out_unlock;
++
++	if (bus_recvq_full(sendctx->other)) {
++		if (!sendctx->timeo) {
++			err = -EAGAIN;
++			goto out_unlock;
++		}
++
++		sendctx->timeo = bus_wait_for_peer(sendctx->other,
++						   sendctx->timeo);
++
++		err = sock_intr_errno(sendctx->timeo);
++		if (signal_pending(current))
++			goto out_free;
++
++		goto restart;
++	}
++
++	if (!sendctx->multicast && !sendctx->eavesdropper) {
++		bus_deliver_skb(skb);
++		bus_state_unlock(sendctx->other);
++		sendctx->other->sk_data_ready(sendctx->other, 0);
++		sock_put(sendctx->other);
++	} else {
++		sendctx->deliver = 1;
++		bus_state_unlock(sendctx->other);
++	}
++
++	return len;
++
++out_unlock:
++	bus_state_unlock(sendctx->other);
++out_free:
++	kfree_skb(skb);
++	if (sendctx->other)
++		sock_put(sendctx->other);
++
++	return err;
++}
++
++static int bus_dgram_sendmsg_mcast(struct sk_buff *skb)
++{
++	struct bus_send_context *sendctx;
++	struct bus_send_context *tmpctx;
++	struct socket *sock;
++	struct sock *sk;
++	struct net *net;
++	struct bus_sock *u, *s;
++	struct hlist_node *node;
++	u16 prefix = 0;
++	struct sk_buff **skb_set = NULL;
++	struct bus_send_context **sendctx_set = NULL;
++	int  rcp_cnt, send_cnt;
++	int i;
++	int err;
++	int len = skb->len;
++	bool (*is_receiver) (struct sock *, u16);
++	bool main_rcp_found = false;
++
++	sendctx = BUSCB(skb).sendctx;
++	sendctx->deliver = 0;
++	sock = sendctx->sender_socket;
++	sk = sock->sk;
++	u = bus_sk(sk);
++	net = sock_net(sk);
++
++	if (sendctx->multicast) {
++		prefix = bus_addr_prefix(sendctx->recipient);
++		if (sendctx->eavesdropper)
++			is_receiver = &bus_has_prefix_eavesdropper;
++		else
++			is_receiver = &bus_has_prefix;
++	} else {
++		is_receiver = &bus_eavesdropper;
++
++		/*
++		 * If the destination is not the peer accepted socket
++		 * we have to get the correct destination.
++		 */
++		if (!sendctx->to_master && sendctx->recipient) {
++			sendctx->other =  bus_find_other(net, sendctx->recipient,
++							 sendctx->namelen,
++							 sk->sk_type,
++							 sk->sk_protocol,
++							 sendctx->hash, &err);
++
++
++			if (sendctx->other == NULL ||
++			    !bus_sk(sendctx->other)->authenticated) {
++
++				if (sendctx->other)
++					sock_put(sendctx->other);
++
++				if (sendctx->other == NULL) {
++					if (!bus_sk(sk)->bus_master_side) {
++						err = -ENOTCONN;
++						sendctx->other = bus_peer_get(sk);
++						if (!sendctx->other)
++							goto out;
++					} else {
++						sendctx->other = sk;
++						sock_hold(sendctx->other);
++					}
++				}
++				sendctx->to_master = 1;
++			}
++		}
++	}
++
++
++try_again:
++	rcp_cnt = 0;
++	main_rcp_found = false;
++
++	spin_lock(&u->bus->lock);
++
++	hlist_for_each_entry(s, node, &u->bus->peers, bus_node) {
++
++		if (!net_eq(sock_net(&s->sk), net))
++			continue;
++
++		if (is_receiver(&s->sk, prefix) ||
++		    (!sendctx->multicast &&
++		     !sendctx->to_master &&
++		     &s->sk == sendctx->other))
++			rcp_cnt++;
++	}
++
++	spin_unlock(&u->bus->lock);
++
++	/*
++	 * Memory can't be allocated while holding a spinlock so
++	 * we have to release the lock, do the allocation for the
++	 * array to store each destination peer sk_buff and grab
++	 * the bus peer lock again. Peers could have joined the
++	 * bus while we relesed the lock so we allocate 5 more
++	 * recipients hoping that this will be enough to not having
++	 * to try again in case only a few peers joined the bus.
++	 */
++	rcp_cnt += 5;
++	skb_set = kzalloc(sizeof(struct sk_buff *) * rcp_cnt, GFP_KERNEL);
++
++	if (!skb_set) {
++		err = -ENOMEM;
++		goto out;
++	}
++
++	sendctx_set = kzalloc(sizeof(struct bus_send_context *) * rcp_cnt,
++			      GFP_KERNEL);
++	if (!sendctx_set) {
++		err = -ENOMEM;
++		goto out;
++	}
++
++	for (i = 0; i < rcp_cnt; i++) {
++		skb_set[i] = skb_clone(skb, GFP_KERNEL);
++		if (!skb_set[i]) {
++			err = -ENOMEM;
++			goto out_free;
++		}
++		sendctx_set[i] = BUSCB(skb_set[i]).sendctx
++			= kmalloc(sizeof(*sendctx) * rcp_cnt, GFP_KERNEL);
++		if (!sendctx_set[i]) {
++			err = -ENOMEM;
++			goto out_free;
++		}
++		memcpy(sendctx_set[i], sendctx, sizeof(*sendctx));
++		err = bus_scm_to_skb(sendctx_set[i]->siocb->scm,
++				     skb_set[i], true);
++		if (err < 0)
++			goto out_free;
++		bus_get_secdata(sendctx_set[i]->siocb->scm,
++				skb_set[i]);
++
++		sendctx_set[i]->other = NULL;
++	}
++
++	send_cnt = 0;
++
++	spin_lock(&u->bus->lock);
++
++	hlist_for_each_entry(s, node, &u->bus->peers, bus_node) {
++
++		if (!net_eq(sock_net(&s->sk), net))
++			continue;
++
++		if (send_cnt >= rcp_cnt) {
++			spin_unlock(&u->bus->lock);
++
++			for (i = 0; i < rcp_cnt; i++) {
++				sock_put(sendctx_set[i]->other);
++				kfree_skb(skb_set[i]);
++				kfree(sendctx_set[i]);
++			}
++			kfree(skb_set);
++			kfree(sendctx_set);
++			sendctx_set = NULL;
++			skb_set = NULL;
++			goto try_again;
++		}
++
++		if (is_receiver(&s->sk, prefix) ||
++		    (!sendctx->multicast &&
++		     !sendctx->to_master &&
++		     &s->sk == sendctx->other)) {
++			skb_set_owner_w(skb_set[send_cnt], &s->sk);
++			tmpctx = BUSCB(skb_set[send_cnt]).sendctx;
++			sock_hold(&s->sk);
++			if (&s->sk == sendctx->other) {
++				tmpctx->main_recipient = 1;
++				main_rcp_found = true;
++			}
++			tmpctx->other = &s->sk;
++			tmpctx->recipient = s->addr->name;
++			tmpctx->eavesdropper = bus_eavesdropper(&s->sk, 0);
++
++			send_cnt++;
++		}
++	}
++
++	spin_unlock(&u->bus->lock);
++
++	/*
++	 * Peers have left the bus so we have to free
++	 * their pre-allocated bus_send_context and
++	 * socket buffers.
++	 */
++	if (send_cnt < rcp_cnt) {
++		for (i = send_cnt; i < rcp_cnt; i++) {
++			kfree_skb(skb_set[i]);
++			kfree(sendctx_set[i]);
++		}
++		rcp_cnt = send_cnt;
++	}
++
++	for (i = 0; i < send_cnt; i++) {
++		tmpctx = BUSCB(skb_set[i]).sendctx;
++		tmpctx->deliver = 0;
++		err = NF_HOOK(NFPROTO_BUS, NF_BUS_SENDING, skb_set[i],
++			      NULL, NULL, bus_dgram_sendmsg_finish);
++		if (err == -EPERM)
++			sock_put(tmpctx->other);
++	}
++
++	/*
++	 * If the send context is not multicast, the destination
++	 * coud be either the peer accepted socket descriptor or
++	 * a peer that is not an eavesdropper. If the peer is not
++	 * the accepted socket descriptor and has been authenticated,
++	 * it is a member of the bus peer list so it has already been
++	 * marked for delivery.
++	 * But if the destination is the accepted socket descriptor
++	 * or is a non-authenticated peer it is not a member of the
++	 * bus peer list so the packet has to be explicitly deliver
++	 * to it.
++	 */
++
++	if (!sendctx->multicast &&
++	    (sendctx->to_master ||
++	     (sendctx->bus_master_side && !main_rcp_found))) {
++		sendctx->main_recipient = 1;
++		err = NF_HOOK(NFPROTO_BUS, NF_BUS_SENDING, skb, NULL, NULL,
++			bus_dgram_sendmsg_finish);
++		if (err == -EPERM)
++			sock_put(sendctx->other);
++	}
++
++	spin_lock(&u->bus->send_lock);
++
++	for (i = 0; i < send_cnt; i++) {
++		tmpctx = sendctx_set[i];
++		if (tmpctx->deliver != 1)
++			continue;
++
++		bus_state_lock(tmpctx->other);
++		bus_deliver_skb(skb_set[i]);
++		bus_state_unlock(tmpctx->other);
++	}
++
++	if (!sendctx->multicast &&
++	    sendctx->deliver == 1 &&
++	    !bus_sk(sendctx->other)->eavesdropper) {
++		bus_state_lock(sendctx->other);
++		bus_deliver_skb(skb);
++		bus_state_unlock(sendctx->other);
++	}
++
++	spin_unlock(&u->bus->send_lock);
++
++	for (i = 0; i < send_cnt; i++) {
++		tmpctx = sendctx_set[i];
++		if (tmpctx->deliver != 1)
++			continue;
++
++		tmpctx->other->sk_data_ready(tmpctx->other, 0);
++		sock_put(tmpctx->other);
++	}
++
++	if (!sendctx->multicast &&
++	    sendctx->deliver == 1 &&
++	    !bus_sk(sendctx->other)->eavesdropper) {
++		sendctx->other->sk_data_ready(sendctx->other, 0);
++		sock_put(sendctx->other);
++	}
++
++	err = len;
++	goto out;
++
++out_free:
++	for (i = 0; i < rcp_cnt; i++) {
++		if (skb_set[i])
++			kfree_skb(skb_set[i]);
++	}
++
++out:
++	kfree(skb_set);
++	if (sendctx_set) {
++		for (i = 0; i < rcp_cnt; i++)
++			kfree(sendctx_set[i]);
++		kfree(sendctx_set);
++	}
++
++	if (sendctx->deliver == 0) {
++		if (!sendctx->to_master &&
++		    !(sendctx->bus_master_side && !main_rcp_found))
++			kfree_skb(skb);
++		if (!sendctx->to_master &&
++		    !(sendctx->bus_master_side && !main_rcp_found))
++			if (sendctx->other)
++				sock_put(sendctx->other);
++	}
++	scm_destroy(sendctx->siocb->scm);
++
++	return err;
++}
++
++static int bus_dgram_sendmsg(struct kiocb *kiocb, struct socket *sock,
++			      struct msghdr *msg, size_t len)
++{
++	struct sock *sk = sock->sk;
++	struct bus_sock *u = bus_sk(sk);
++	struct sockaddr_bus *sbusaddr = msg->msg_name;
++	int err;
++	struct sk_buff *skb;
++	struct scm_cookie tmp_scm;
++	bool to_master = false;
++	bool multicast = false;
++	struct bus_send_context sendctx;
++
++	if (!msg->msg_namelen)
++		sbusaddr = NULL;
++
++	if (sbusaddr && !bus_same_bus(sbusaddr, u->addr->name))
++		return -EHOSTUNREACH;
++
++	if ((!sbusaddr && !u->bus_master_side) ||
++	    (sbusaddr && sbusaddr->sbus_addr.s_addr == BUS_MASTER_ADDR))
++		to_master = true;
++	else if (sbusaddr && !u->bus_master_side && !u->authenticated)
++		return -EHOSTUNREACH;
++
++	sendctx.namelen = 0; /* fake GCC */
++	sendctx.siocb = kiocb_to_siocb(kiocb);
++	sendctx.other = NULL;
++
++	if (NULL == sendctx.siocb->scm)
++		sendctx.siocb->scm = &tmp_scm;
++	wait_for_bus_gc();
++	err = scm_send(sock, msg, sendctx.siocb->scm);
++	if (err < 0)
++		return err;
++
++	err = -EOPNOTSUPP;
++	if (msg->msg_flags&MSG_OOB)
++		goto out;
++
++	if (sbusaddr && !to_master) {
++		err = bus_mkname(sbusaddr, msg->msg_namelen, &sendctx.hash);
++		if (err < 0)
++			goto out;
++		sendctx.namelen = err;
++		multicast = bus_mc_addr(sbusaddr);
++	} else {
++		err = -ENOTCONN;
++		sendctx.other = bus_peer_get(sk);
++		if (!sendctx.other)
++			goto out;
++	}
++
++	err = -EMSGSIZE;
++	if (len > sk->sk_sndbuf - 32)
++		goto out;
++
++	sendctx.timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
++
++restart:
++	bus_state_lock(sk);
++	if (bus_recvq_full(sk)) {
++		err = -EAGAIN;
++		if (!sendctx.timeo) {
++			bus_state_unlock(sk);
++			goto out;
++		}
++
++		sendctx.timeo = bus_wait_for_peer(sk, sendctx.timeo);
++
++		err = sock_intr_errno(sendctx.timeo);
++		if (signal_pending(current))
++			goto out;
++
++		goto restart;
++	} else {
++		bus_state_unlock(sk);
++	}
++
++	skb = sock_alloc_send_skb(sk, len, msg->msg_flags&MSG_DONTWAIT, &err);
++	if (skb == NULL)
++		goto out;
++
++	err = bus_scm_to_skb(sendctx.siocb->scm, skb, true);
++	if (err < 0)
++		goto out_free;
++	sendctx.max_level = err + 1;
++	bus_get_secdata(sendctx.siocb->scm, skb);
++
++	skb_reset_transport_header(skb);
++	err = memcpy_fromiovec(skb_put(skb, len), msg->msg_iov, len);
++	if (err)
++		goto out_free;
++
++	sendctx.sender_socket = sock;
++	if (u->bus_master_side && sendctx.other) {
++		/* if the bus master sent an unicast message to a peer, we
++		 * need the address of that peer
++		 */
++		sendctx.sender = bus_sk(sendctx.other)->addr->name;
++	} else {
++		sendctx.sender = u->addr->name;
++	}
++	sendctx.recipient = sbusaddr;
++	sendctx.authenticated = u->authenticated;
++	sendctx.bus_master_side = u->bus_master_side;
++	sendctx.to_master = to_master;
++	sendctx.multicast = multicast;
++	sendctx.eavesdropper = atomic64_read(&u->bus->eavesdropper_cnt) ? 1 : 0;
++	BUSCB(skb).sendctx = &sendctx;
++
++	if (sendctx.multicast || sendctx.eavesdropper) {
++		sendctx.main_recipient = 0;
++		err = bus_dgram_sendmsg_mcast(skb);
++		return sendctx.multicast ? len : err;
++	} else {
++		sendctx.main_recipient = 1;
++		len = NF_HOOK(NFPROTO_BUS, NF_BUS_SENDING, skb, NULL, NULL,
++			      bus_dgram_sendmsg_finish);
++
++		if (len == -EPERM) {
++			err = len;
++			goto out;
++		} else {
++			scm_destroy(sendctx.siocb->scm);
++			return len;
++		}
++	}
++
++out_free:
++	kfree_skb(skb);
++out:
++	if (sendctx.other)
++		sock_put(sendctx.other);
++	scm_destroy(sendctx.siocb->scm);
++	return err;
++}
++
++static int bus_seqpacket_sendmsg(struct kiocb *kiocb, struct socket *sock,
++				  struct msghdr *msg, size_t len)
++{
++	int err;
++	struct sock *sk = sock->sk;
++
++	err = sock_error(sk);
++	if (err)
++		return err;
++
++	if (sk->sk_state != TCP_ESTABLISHED)
++		return -ENOTCONN;
++
++	return bus_dgram_sendmsg(kiocb, sock, msg, len);
++}
++
++static int bus_seqpacket_recvmsg(struct kiocb *iocb, struct socket *sock,
++			      struct msghdr *msg, size_t size,
++			      int flags)
++{
++	struct sock *sk = sock->sk;
++
++	if (sk->sk_state != TCP_ESTABLISHED)
++		return -ENOTCONN;
++
++	return bus_dgram_recvmsg(iocb, sock, msg, size, flags);
++}
++
++static void bus_copy_addr(struct msghdr *msg, struct sock *sk)
++{
++	struct bus_sock *u = bus_sk(sk);
++
++	msg->msg_namelen = 0;
++	if (u->addr) {
++		msg->msg_namelen = u->addr->len;
++		memcpy(msg->msg_name, u->addr->name,
++		       sizeof(struct sockaddr_bus));
++	}
++}
++
++static int bus_dgram_recvmsg(struct kiocb *iocb, struct socket *sock,
++			      struct msghdr *msg, size_t size,
++			      int flags)
++{
++	struct sock_iocb *siocb = kiocb_to_siocb(iocb);
++	struct scm_cookie tmp_scm;
++	struct sock *sk = sock->sk;
++	struct bus_sock *u = bus_sk(sk);
++	int noblock = flags & MSG_DONTWAIT;
++	struct sk_buff *skb;
++	int err;
++	int skip = 0;
++
++	err = -EOPNOTSUPP;
++	if (flags&MSG_OOB)
++		goto out;
++
++	msg->msg_namelen = 0;
++
++	err = mutex_lock_interruptible(&u->readlock);
++	if (err) {
++		err = sock_intr_errno(sock_rcvtimeo(sk, noblock));
++		goto out;
++	}
++
++	skb = skb_recv_datagram(sk, flags, noblock, &err);
++	if (!skb) {
++		bus_state_lock(sk);
++		/* Signal EOF on disconnected non-blocking SEQPACKET socket. */
++		if (sk->sk_type == SOCK_SEQPACKET && err == -EAGAIN &&
++		    (sk->sk_shutdown & RCV_SHUTDOWN))
++			err = 0;
++		bus_state_unlock(sk);
++		goto out_unlock;
++	}
++
++	wake_up_interruptible_sync_poll(&u->peer_wait,
++					POLLOUT | POLLWRNORM | POLLWRBAND);
++
++	if (msg->msg_name)
++		bus_copy_addr(msg, skb->sk);
++
++	if (size > skb->len - skip)
++		size = skb->len - skip;
++	else if (size < skb->len - skip)
++		msg->msg_flags |= MSG_TRUNC;
++
++	err = skb_copy_datagram_iovec(skb, skip, msg->msg_iov, size);
++	if (err)
++		goto out_free;
++
++	if (sock_flag(sk, SOCK_RCVTSTAMP))
++		__sock_recv_timestamp(msg, sk, skb);
++
++	if (!siocb->scm) {
++		siocb->scm = &tmp_scm;
++		memset(&tmp_scm, 0, sizeof(tmp_scm));
++	}
++	scm_set_cred(siocb->scm, BUSCB(skb).pid, BUSCB(skb).cred);
++	bus_set_secdata(siocb->scm, skb);
++
++	if (!(flags & MSG_PEEK)) {
++		if (BUSCB(skb).fp)
++			bus_detach_fds(siocb->scm, skb);
++	} else {
++		/* It is questionable: on PEEK we could:
++		   - do not return fds - good, but too simple 8)
++		   - return fds, and do not return them on read (old strategy,
++		     apparently wrong)
++		   - clone fds (I chose it for now, it is the most universal
++		     solution)
++
++		   POSIX 1003.1g does not actually define this clearly
++		   at all. POSIX 1003.1g doesn't define a lot of things
++		   clearly however!
++
++		*/
++		if (BUSCB(skb).fp)
++			siocb->scm->fp = scm_fp_dup(BUSCB(skb).fp);
++	}
++	err = (flags & MSG_TRUNC) ? skb->len - skip : size;
++
++	scm_recv(sock, msg, siocb->scm, flags);
++
++out_free:
++	skb_free_datagram(sk, skb);
++out_unlock:
++	mutex_unlock(&u->readlock);
++out:
++	return err;
++}
++
++static int bus_shutdown(struct socket *sock, int mode)
++{
++	struct sock *sk = sock->sk;
++	struct sock *other;
++
++	mode = (mode+1)&(RCV_SHUTDOWN|SEND_SHUTDOWN);
++
++	if (!mode)
++		return 0;
++
++	bus_state_lock(sk);
++	sk->sk_shutdown |= mode;
++	other = bus_peer(sk);
++	if (other)
++		sock_hold(other);
++	bus_state_unlock(sk);
++	sk->sk_state_change(sk);
++
++	if (other &&
++		(sk->sk_type == SOCK_STREAM || sk->sk_type == SOCK_SEQPACKET)) {
++
++		int peer_mode = 0;
++
++		if (mode&RCV_SHUTDOWN)
++			peer_mode |= SEND_SHUTDOWN;
++		if (mode&SEND_SHUTDOWN)
++			peer_mode |= RCV_SHUTDOWN;
++		bus_state_lock(other);
++		other->sk_shutdown |= peer_mode;
++		bus_state_unlock(other);
++		other->sk_state_change(other);
++		if (peer_mode == SHUTDOWN_MASK)
++			sk_wake_async(other, SOCK_WAKE_WAITD, POLL_HUP);
++		else if (peer_mode & RCV_SHUTDOWN)
++			sk_wake_async(other, SOCK_WAKE_WAITD, POLL_IN);
++	}
++	if (other)
++		sock_put(other);
++
++	return 0;
++}
++
++static int bus_add_addr(struct sock *sk, struct bus_addr *sbus_addr)
++{
++	struct bus_address *addr;
++	struct sock *other;
++	struct bus_sock *u = bus_sk(sk);
++	struct net *net = sock_net(sk);
++	int ret = 0;
++
++	addr = kzalloc(sizeof(*addr) + sizeof(struct sockaddr_bus), GFP_KERNEL);
++	if (!addr) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	memcpy(addr->name, u->addr->name, sizeof(struct sockaddr_bus));
++	addr->len = u->addr->len;
++
++	addr->name->sbus_addr.s_addr = sbus_addr->s_addr;
++	addr->hash = bus_compute_hash(addr->name->sbus_addr);
++	other = bus_find_socket_byaddress(net, addr->name, addr->len,
++					  sk->sk_type, sk->sk_protocol,
++					  addr->hash);
++
++	if (other) {
++		sock_put(other);
++		kfree(addr);
++		ret = -EADDRINUSE;
++		goto out;
++	}
++
++	atomic_set(&addr->refcnt, 1);
++	INIT_HLIST_NODE(&addr->addr_node);
++	INIT_HLIST_NODE(&addr->table_node);
++
++	addr->sock = sk;
++
++	hlist_add_head(&addr->addr_node, &u->addr_list);
++	bus_insert_address(&bus_address_table[addr->hash], addr);
++
++out:
++	sock_put(sk);
++
++	return ret;
++}
++
++static int bus_del_addr(struct sock *sk, struct bus_addr *sbus_addr)
++{
++	struct bus_address *addr;
++	int ret = 0;
++
++	bus_state_lock(sk);
++	addr = __bus_get_address(sk, sbus_addr);
++	if (!addr) {
++		ret = -EINVAL;
++		bus_state_unlock(sk);
++		goto out;
++	}
++	hlist_del(&addr->addr_node);
++	bus_state_unlock(sk);
++
++	bus_remove_address(addr);
++	bus_release_addr(addr);
++out:
++	sock_put(sk);
++
++	return ret;
++}
++
++static int bus_join_bus(struct sock *sk)
++{
++	struct sock *peer;
++	struct bus_sock *u = bus_sk(sk), *peeru;
++	int err = 0;
++
++	peer = bus_peer_get(sk);
++	if (!peer)
++		return -ENOTCONN;
++	peeru = bus_sk(peer);
++
++	if (!u->bus_master_side || peeru->authenticated) {
++		err = -EINVAL;
++		goto sock_put_out;
++	}
++
++	if (sk->sk_state != TCP_ESTABLISHED) {
++		err = -ENOTCONN;
++		goto sock_put_out;
++	}
++
++	if (peer->sk_shutdown != 0) {
++		err = -ENOTCONN;
++		goto sock_put_out;
++	}
++
++	bus_state_lock(peer);
++	peeru->authenticated = true;
++	bus_state_unlock(peer);
++
++	spin_lock(&u->bus->lock);
++	hlist_add_head(&peeru->bus_node, &u->bus->peers);
++	spin_unlock(&u->bus->lock);
++
++sock_put_out:
++	sock_put(peer);
++	return err;
++}
++
++static int __bus_set_eavesdrop(struct sock *sk, bool eavesdrop)
++{
++	struct sock *peer = bus_peer_get(sk);
++	struct bus_sock *u = bus_sk(sk), *peeru;
++	int err = 0;
++
++	if (!peer)
++		return -ENOTCONN;
++
++	if (sk->sk_state != TCP_ESTABLISHED) {
++		err = -ENOTCONN;
++		goto sock_put_out;
++	}
++
++	peeru = bus_sk(peer);
++
++	if (!u->bus_master_side || !peeru->authenticated) {
++		err = -EINVAL;
++		goto sock_put_out;
++	}
++
++	if (peer->sk_shutdown != 0) {
++		err = -ENOTCONN;
++		goto sock_put_out;
++	}
++
++	bus_state_lock(peeru);
++	if (peeru->eavesdropper != eavesdrop) {
++		peeru->eavesdropper = eavesdrop;
++		if (eavesdrop)
++			atomic64_inc(&u->bus->eavesdropper_cnt);
++		else
++			atomic64_dec(&u->bus->eavesdropper_cnt);
++	}
++	bus_state_unlock(peeru);
++
++sock_put_out:
++	sock_put(peer);
++	return err;
++}
++
++static int bus_set_eavesdrop(struct sock *sk)
++{
++	return __bus_set_eavesdrop(sk, true);
++}
++
++static int bus_unset_eavesdrop(struct sock *sk)
++{
++	return __bus_set_eavesdrop(sk, false);
++}
++
++static int bus_setsockopt(struct socket *sock, int level, int optname,
++			   char __user *optval, unsigned int optlen)
++{
++	struct bus_addr addr;
++	int res;
++
++	if (level != SOL_BUS)
++		return -ENOPROTOOPT;
++
++	switch (optname) {
++	case BUS_ADD_ADDR:
++	case BUS_DEL_ADDR:
++		if (optlen < sizeof(struct bus_addr))
++			return -EINVAL;
++
++		if (!bus_sk(sock->sk)->bus_master_side)
++			return -EINVAL;
++
++		if (copy_from_user(&addr, optval, sizeof(struct bus_addr)))
++			return -EFAULT;
++
++		if (optname == BUS_ADD_ADDR)
++			res = bus_add_addr(bus_peer_get(sock->sk), &addr);
++		else
++			res = bus_del_addr(bus_peer_get(sock->sk), &addr);
++		break;
++	case BUS_JOIN_BUS:
++		res = bus_join_bus(sock->sk);
++		break;
++	case BUS_SET_EAVESDROP:
++		res = bus_set_eavesdrop(sock->sk);
++		break;
++	case BUS_UNSET_EAVESDROP:
++		res = bus_unset_eavesdrop(sock->sk);
++		break;
++	default:
++		res = -EINVAL;
++		break;
++	}
++
++	return res;
++}
++
++long bus_inq_len(struct sock *sk)
++{
++	struct sk_buff *skb;
++	long amount = 0;
++
++	if (sk->sk_state == TCP_LISTEN)
++		return -EINVAL;
++
++	spin_lock(&sk->sk_receive_queue.lock);
++	skb_queue_walk(&sk->sk_receive_queue, skb)
++		amount += skb->len;
++	spin_unlock(&sk->sk_receive_queue.lock);
++
++	return amount;
++}
++EXPORT_SYMBOL_GPL(bus_inq_len);
++
++long bus_outq_len(struct sock *sk)
++{
++	return sk_wmem_alloc_get(sk);
++}
++EXPORT_SYMBOL_GPL(bus_outq_len);
++
++static inline void sk_sndbuf_set(struct sock *sk, int sndbuf)
++{
++	sk->sk_sndbuf = sndbuf;
++}
++
++static int bus_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
++{
++	struct sock *sk = sock->sk;
++	long amount = 0;
++	int err, sndbuf;
++
++	switch (cmd) {
++	case SIOCOUTQ:
++		amount = bus_outq_len(sk);
++		err = put_user(amount, (int __user *)arg);
++		break;
++	case SIOCINQ:
++		amount = bus_inq_len(sk);
++		if (amount < 0)
++			err = amount;
++		else
++			err = put_user(amount, (int __user *)arg);
++		break;
++	case SIOCSINQ:
++		if (sk->sk_state != TCP_LISTEN)
++			err = -EINVAL;
++		else {
++			err = -EFAULT;
++
++			if (get_user(sndbuf, (int __user *)arg))
++				break;
++
++			err = 0;
++			sk_sndbuf_set(sk, sndbuf);
++			break;
++		}
++		break;
++	default:
++		err = -ENOIOCTLCMD;
++		break;
++	}
++	return err;
++}
++
++static unsigned int bus_dgram_poll(struct file *file, struct socket *sock,
++				    poll_table *wait)
++{
++	struct sock *sk = sock->sk, *other;
++	unsigned int mask, writable;
++	struct bus_sock *u = bus_sk(sk), *p;
++	struct hlist_node *node;
++
++	sock_poll_wait(file, sk_sleep(sk), wait);
++	mask = 0;
++
++	/* exceptional events? */
++	if (sk->sk_err || !skb_queue_empty(&sk->sk_error_queue))
++		mask |= POLLERR;
++	if (sk->sk_shutdown & RCV_SHUTDOWN)
++		mask |= POLLRDHUP | POLLIN | POLLRDNORM;
++	if (sk->sk_shutdown == SHUTDOWN_MASK)
++		mask |= POLLHUP;
++
++	/* readable? */
++	if (!skb_queue_empty(&sk->sk_receive_queue))
++		mask |= POLLIN | POLLRDNORM;
++
++	/* Connection-based need to check for termination and startup */
++	if (sk->sk_type == SOCK_SEQPACKET) {
++		if (sk->sk_state == TCP_CLOSE)
++			mask |= POLLHUP;
++		/* connection hasn't started yet? */
++		if (sk->sk_state == TCP_SYN_SENT)
++			return mask;
++	}
++
++	/* No write status requested, avoid expensive OUT tests. */
++	if (wait && !(wait->key & (POLLWRBAND | POLLWRNORM | POLLOUT)))
++		return mask;
++
++	writable = bus_writable(sk);
++	other = bus_peer_get(sk);
++	if (other) {
++		if (bus_recvq_full(other)) {
++			writable = 0;
++		}
++		sock_put(other);
++	}
++
++	/*
++	 * If the socket has already joined the bus we have to check
++	 * that each peer receiver queue on the bus is not full.
++	 */
++	if (!u->bus_master_side && u->authenticated) {
++		spin_lock(&u->bus->lock);
++		hlist_for_each_entry(p, node, &u->bus->peers, bus_node) {
++			if (bus_recvq_full(&p->sk)) {
++				writable = 0;
++				break;
++			}
++		}
++		spin_unlock(&u->bus->lock);
++	}
++
++	if (writable)
++		mask |= POLLOUT | POLLWRNORM | POLLWRBAND;
++	else
++		set_bit(SOCK_ASYNC_NOSPACE, &sk->sk_socket->flags);
++
++	return mask;
++}
++
++#ifdef CONFIG_PROC_FS
++static struct sock *first_bus_socket(int *i)
++{
++	for (*i = 0; *i <= BUS_HASH_SIZE; (*i)++) {
++		if (!hlist_empty(&bus_socket_table[*i]))
++			return __sk_head(&bus_socket_table[*i]);
++	}
++	return NULL;
++}
++
++static struct sock *next_bus_socket(int *i, struct sock *s)
++{
++	struct sock *next = sk_next(s);
++	/* More in this chain? */
++	if (next)
++		return next;
++	/* Look for next non-empty chain. */
++	for ((*i)++; *i <= BUS_HASH_SIZE; (*i)++) {
++		if (!hlist_empty(&bus_socket_table[*i]))
++			return __sk_head(&bus_socket_table[*i]);
++	}
++	return NULL;
++}
++
++struct bus_iter_state {
++	struct seq_net_private p;
++	int i;
++};
++
++static struct sock *bus_seq_idx(struct seq_file *seq, loff_t pos)
++{
++	struct bus_iter_state *iter = seq->private;
++	loff_t off = 0;
++	struct sock *s;
++
++	for (s = first_bus_socket(&iter->i); s; s = next_bus_socket(&iter->i, s)) {
++		if (sock_net(s) != seq_file_net(seq))
++			continue;
++		if (off == pos)
++			return s;
++		++off;
++	}
++	return NULL;
++}
++
++static void *bus_seq_start(struct seq_file *seq, loff_t *pos)
++	__acquires(bus_table_lock)
++{
++	spin_lock(&bus_table_lock);
++	return *pos ? bus_seq_idx(seq, *pos - 1) : SEQ_START_TOKEN;
++}
++
++static void *bus_seq_next(struct seq_file *seq, void *v, loff_t *pos)
++{
++	struct bus_iter_state *iter = seq->private;
++	struct sock *sk = v;
++	++*pos;
++
++	if (v == SEQ_START_TOKEN)
++		sk = first_bus_socket(&iter->i);
++	else
++		sk = next_bus_socket(&iter->i, sk);
++	while (sk && (sock_net(sk) != seq_file_net(seq)))
++		sk = next_bus_socket(&iter->i, sk);
++	return sk;
++}
++
++static void bus_seq_stop(struct seq_file *seq, void *v)
++	__releases(bus_table_lock)
++{
++	spin_unlock(&bus_table_lock);
++}
++
++static int bus_seq_show(struct seq_file *seq, void *v)
++{
++
++	if (v == SEQ_START_TOKEN)
++		seq_puts(seq, "Num       RefCount Protocol Flags    Type St " \
++			 "Inode Path\n");
++	else {
++		struct sock *s = v;
++		struct bus_sock *u = bus_sk(s);
++		bus_state_lock(s);
++
++		seq_printf(seq, "%pK: %08X %08X %08X %04X %02X %5lu",
++			s,
++			atomic_read(&s->sk_refcnt),
++			0,
++			s->sk_state == TCP_LISTEN ? __SO_ACCEPTCON : 0,
++			s->sk_type,
++			s->sk_socket ?
++			(s->sk_state == TCP_ESTABLISHED ? SS_CONNECTED : SS_UNCONNECTED) :
++			(s->sk_state == TCP_ESTABLISHED ? SS_CONNECTING : SS_DISCONNECTING),
++			sock_i_ino(s));
++
++		if (u->addr) {
++			int i, len;
++			seq_putc(seq, ' ');
++
++			i = 0;
++			len = u->addr->len - sizeof(short);
++			if (!BUS_ABSTRACT(s))
++				len--;
++			else {
++				seq_putc(seq, '@');
++				i++;
++			}
++			for ( ; i < len; i++)
++				seq_putc(seq, u->addr->name->sbus_path[i]);
++		}
++		bus_state_unlock(s);
++		seq_putc(seq, '\n');
++	}
++
++	return 0;
++}
++
++static const struct seq_operations bus_seq_ops = {
++	.start  = bus_seq_start,
++	.next   = bus_seq_next,
++	.stop   = bus_seq_stop,
++	.show   = bus_seq_show,
++};
++
++static int bus_seq_open(struct inode *inode, struct file *file)
++{
++	return seq_open_net(inode, file, &bus_seq_ops,
++			    sizeof(struct bus_iter_state));
++}
++
++static const struct file_operations bus_seq_fops = {
++	.owner		= THIS_MODULE,
++	.open		= bus_seq_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release_net,
++};
++
++#endif
++
++static const struct net_proto_family bus_family_ops = {
++	.family = PF_BUS,
++	.create = bus_create,
++	.owner	= THIS_MODULE,
++};
++
++
++static int __net_init bus_net_init(struct net *net)
++{
++	int error = -ENOMEM;
++
++	net->unx.sysctl_max_dgram_qlen = 10;
++	if (bus_sysctl_register(net))
++		goto out;
++
++#ifdef CONFIG_PROC_FS
++	if (!proc_net_fops_create(net, "bus", 0, &bus_seq_fops)) {
++		bus_sysctl_unregister(net);
++		goto out;
++	}
++#endif
++	error = 0;
++out:
++	return error;
++}
++
++static void __net_exit bus_net_exit(struct net *net)
++{
++	bus_sysctl_unregister(net);
++	proc_net_remove(net, "bus");
++}
++
++static struct pernet_operations bus_net_ops = {
++	.init = bus_net_init,
++	.exit = bus_net_exit,
++};
++
++static int __init af_bus_init(void)
++{
++	int rc = -1;
++	struct sk_buff *dummy_skb;
++
++	BUILD_BUG_ON(sizeof(struct bus_skb_parms) > sizeof(dummy_skb->cb));
++
++	rc = proto_register(&bus_proto, 1);
++	if (rc != 0) {
++		printk(KERN_CRIT "%s: Cannot create bus_sock SLAB cache!\n",
++		       __func__);
++		goto out;
++	}
++
++	sock_register(&bus_family_ops);
++	register_pernet_subsys(&bus_net_ops);
++out:
++	return rc;
++}
++
++static void __exit af_bus_exit(void)
++{
++	sock_unregister(PF_BUS);
++	proto_unregister(&bus_proto);
++	unregister_pernet_subsys(&bus_net_ops);
++}
++
++/* Earlier than device_initcall() so that other drivers invoking
++   request_module() don't end up in a loop when modprobe tries
++   to use a BUS socket. But later than subsys_initcall() because
++   we depend on stuff initialised there */
++fs_initcall(af_bus_init);
++module_exit(af_bus_exit);
++
++MODULE_AUTHOR("Alban Crequy, Javier Martinez Canillas");
++MODULE_DESCRIPTION("Linux Bus domain sockets");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS_NETPROTO(PF_BUS);
+diff --git a/net/bus/garbage.c b/net/bus/garbage.c
+new file mode 100644
+index 0000000..2435f38
+--- /dev/null
++++ b/net/bus/garbage.c
+@@ -0,0 +1,322 @@
++/*
++ * Garbage Collector For AF_BUS sockets
++ *
++ * Based on Garbage Collector For AF_UNIX sockets (net/unix/garbage.c).
++ */
++
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/socket.h>
++#include <linux/un.h>
++#include <linux/net.h>
++#include <linux/fs.h>
++#include <linux/skbuff.h>
++#include <linux/netdevice.h>
++#include <linux/file.h>
++#include <linux/proc_fs.h>
++#include <linux/mutex.h>
++#include <linux/wait.h>
++
++#include <net/sock.h>
++#include <net/af_bus.h>
++#include <net/scm.h>
++#include <net/tcp_states.h>
++
++/* Internal data structures and random procedures: */
++
++static LIST_HEAD(gc_inflight_list);
++static LIST_HEAD(gc_candidates);
++static DEFINE_SPINLOCK(bus_gc_lock);
++static DECLARE_WAIT_QUEUE_HEAD(bus_gc_wait);
++
++unsigned int bus_tot_inflight;
++
++
++struct sock *bus_get_socket(struct file *filp)
++{
++	struct sock *u_sock = NULL;
++	struct inode *inode = filp->f_path.dentry->d_inode;
++
++	/*
++	 *	Socket ?
++	 */
++	if (S_ISSOCK(inode->i_mode) && !(filp->f_mode & FMODE_PATH)) {
++		struct socket *sock = SOCKET_I(inode);
++		struct sock *s = sock->sk;
++
++		/*
++		 *	PF_BUS ?
++		 */
++		if (s && sock->ops && sock->ops->family == PF_BUS)
++			u_sock = s;
++	}
++	return u_sock;
++}
++
++/*
++ *	Keep the number of times in flight count for the file
++ *	descriptor if it is for an AF_BUS socket.
++ */
++
++void bus_inflight(struct file *fp)
++{
++	struct sock *s = bus_get_socket(fp);
++	if (s) {
++		struct bus_sock *u = bus_sk(s);
++		spin_lock(&bus_gc_lock);
++		if (atomic_long_inc_return(&u->inflight) == 1) {
++			BUG_ON(!list_empty(&u->link));
++			list_add_tail(&u->link, &gc_inflight_list);
++		} else {
++			BUG_ON(list_empty(&u->link));
++		}
++		bus_tot_inflight++;
++		spin_unlock(&bus_gc_lock);
++	}
++}
++
++void bus_notinflight(struct file *fp)
++{
++	struct sock *s = bus_get_socket(fp);
++	if (s) {
++		struct bus_sock *u = bus_sk(s);
++		spin_lock(&bus_gc_lock);
++		BUG_ON(list_empty(&u->link));
++		if (atomic_long_dec_and_test(&u->inflight))
++			list_del_init(&u->link);
++		bus_tot_inflight--;
++		spin_unlock(&bus_gc_lock);
++	}
++}
++
++static void scan_inflight(struct sock *x, void (*func)(struct bus_sock *),
++			  struct sk_buff_head *hitlist)
++{
++	struct sk_buff *skb;
++	struct sk_buff *next;
++
++	spin_lock(&x->sk_receive_queue.lock);
++	skb_queue_walk_safe(&x->sk_receive_queue, skb, next) {
++		/*
++		 *	Do we have file descriptors ?
++		 */
++		if (BUSCB(skb).fp) {
++			bool hit = false;
++			/*
++			 *	Process the descriptors of this socket
++			 */
++			int nfd = BUSCB(skb).fp->count;
++			struct file **fp = BUSCB(skb).fp->fp;
++			while (nfd--) {
++				/*
++				 *	Get the socket the fd matches
++				 *	if it indeed does so
++				 */
++				struct sock *sk = bus_get_socket(*fp++);
++				if (sk) {
++					struct bus_sock *u = bus_sk(sk);
++
++					/*
++					 * Ignore non-candidates, they could
++					 * have been added to the queues after
++					 * starting the garbage collection
++					 */
++					if (u->gc_candidate) {
++						hit = true;
++						func(u);
++					}
++				}
++			}
++			if (hit && hitlist != NULL) {
++				__skb_unlink(skb, &x->sk_receive_queue);
++				__skb_queue_tail(hitlist, skb);
++			}
++		}
++	}
++	spin_unlock(&x->sk_receive_queue.lock);
++}
++
++static void scan_children(struct sock *x, void (*func)(struct bus_sock *),
++			  struct sk_buff_head *hitlist)
++{
++	if (x->sk_state != TCP_LISTEN)
++		scan_inflight(x, func, hitlist);
++	else {
++		struct sk_buff *skb;
++		struct sk_buff *next;
++		struct bus_sock *u;
++		LIST_HEAD(embryos);
++
++		/*
++		 * For a listening socket collect the queued embryos
++		 * and perform a scan on them as well.
++		 */
++		spin_lock(&x->sk_receive_queue.lock);
++		skb_queue_walk_safe(&x->sk_receive_queue, skb, next) {
++			u = bus_sk(skb->sk);
++
++			/*
++			 * An embryo cannot be in-flight, so it's safe
++			 * to use the list link.
++			 */
++			BUG_ON(!list_empty(&u->link));
++			list_add_tail(&u->link, &embryos);
++		}
++		spin_unlock(&x->sk_receive_queue.lock);
++
++		while (!list_empty(&embryos)) {
++			u = list_entry(embryos.next, struct bus_sock, link);
++			scan_inflight(&u->sk, func, hitlist);
++			list_del_init(&u->link);
++		}
++	}
++}
++
++static void dec_inflight(struct bus_sock *usk)
++{
++	atomic_long_dec(&usk->inflight);
++}
++
++static void inc_inflight(struct bus_sock *usk)
++{
++	atomic_long_inc(&usk->inflight);
++}
++
++static void inc_inflight_move_tail(struct bus_sock *u)
++{
++	atomic_long_inc(&u->inflight);
++	/*
++	 * If this still might be part of a cycle, move it to the end
++	 * of the list, so that it's checked even if it was already
++	 * passed over
++	 */
++	if (u->gc_maybe_cycle)
++		list_move_tail(&u->link, &gc_candidates);
++}
++
++static bool gc_in_progress = false;
++#define BUS_INFLIGHT_TRIGGER_GC 16000
++
++void wait_for_bus_gc(void)
++{
++	/*
++	 * If number of inflight sockets is insane,
++	 * force a garbage collect right now.
++	 */
++	if (bus_tot_inflight > BUS_INFLIGHT_TRIGGER_GC && !gc_in_progress)
++		bus_gc();
++	wait_event(bus_gc_wait, gc_in_progress == false);
++}
++
++/* The external entry point: bus_gc() */
++void bus_gc(void)
++{
++	struct bus_sock *u;
++	struct bus_sock *next;
++	struct sk_buff_head hitlist;
++	struct list_head cursor;
++	LIST_HEAD(not_cycle_list);
++
++	spin_lock(&bus_gc_lock);
++
++	/* Avoid a recursive GC. */
++	if (gc_in_progress)
++		goto out;
++
++	gc_in_progress = true;
++	/*
++	 * First, select candidates for garbage collection.  Only
++	 * in-flight sockets are considered, and from those only ones
++	 * which don't have any external reference.
++	 *
++	 * Holding bus_gc_lock will protect these candidates from
++	 * being detached, and hence from gaining an external
++	 * reference.  Since there are no possible receivers, all
++	 * buffers currently on the candidates' queues stay there
++	 * during the garbage collection.
++	 *
++	 * We also know that no new candidate can be added onto the
++	 * receive queues.  Other, non candidate sockets _can_ be
++	 * added to queue, so we must make sure only to touch
++	 * candidates.
++	 */
++	list_for_each_entry_safe(u, next, &gc_inflight_list, link) {
++		long total_refs;
++		long inflight_refs;
++
++		total_refs = file_count(u->sk.sk_socket->file);
++		inflight_refs = atomic_long_read(&u->inflight);
++
++		BUG_ON(inflight_refs < 1);
++		BUG_ON(total_refs < inflight_refs);
++		if (total_refs == inflight_refs) {
++			list_move_tail(&u->link, &gc_candidates);
++			u->gc_candidate = 1;
++			u->gc_maybe_cycle = 1;
++		}
++	}
++
++	/*
++	 * Now remove all internal in-flight reference to children of
++	 * the candidates.
++	 */
++	list_for_each_entry(u, &gc_candidates, link)
++		scan_children(&u->sk, dec_inflight, NULL);
++
++	/*
++	 * Restore the references for children of all candidates,
++	 * which have remaining references.  Do this recursively, so
++	 * only those remain, which form cyclic references.
++	 *
++	 * Use a "cursor" link, to make the list traversal safe, even
++	 * though elements might be moved about.
++	 */
++	list_add(&cursor, &gc_candidates);
++	while (cursor.next != &gc_candidates) {
++		u = list_entry(cursor.next, struct bus_sock, link);
++
++		/* Move cursor to after the current position. */
++		list_move(&cursor, &u->link);
++
++		if (atomic_long_read(&u->inflight) > 0) {
++			list_move_tail(&u->link, &not_cycle_list);
++			u->gc_maybe_cycle = 0;
++			scan_children(&u->sk, inc_inflight_move_tail, NULL);
++		}
++	}
++	list_del(&cursor);
++
++	/*
++	 * not_cycle_list contains those sockets which do not make up a
++	 * cycle.  Restore these to the inflight list.
++	 */
++	while (!list_empty(&not_cycle_list)) {
++		u = list_entry(not_cycle_list.next, struct bus_sock, link);
++		u->gc_candidate = 0;
++		list_move_tail(&u->link, &gc_inflight_list);
++	}
++
++	/*
++	 * Now gc_candidates contains only garbage.  Restore original
++	 * inflight counters for these as well, and remove the skbuffs
++	 * which are creating the cycle(s).
++	 */
++	skb_queue_head_init(&hitlist);
++	list_for_each_entry(u, &gc_candidates, link)
++	scan_children(&u->sk, inc_inflight, &hitlist);
++
++	spin_unlock(&bus_gc_lock);
++
++	/* Here we are. Hitlist is filled. Die. */
++	__skb_queue_purge(&hitlist);
++
++	spin_lock(&bus_gc_lock);
++
++	/* All candidates should have been detached by now. */
++	BUG_ON(!list_empty(&gc_candidates));
++	gc_in_progress = false;
++	wake_up(&bus_gc_wait);
++
++ out:
++	spin_unlock(&bus_gc_lock);
++}
+diff --git a/net/bus/sysctl_net_bus.c b/net/bus/sysctl_net_bus.c
+new file mode 100644
+index 0000000..b376003
+--- /dev/null
++++ b/net/bus/sysctl_net_bus.c
+@@ -0,0 +1,59 @@
++/*
++ * Sysctl interface to net af_bus subsystem.
++ *
++ * Based on Sysctl interface to net af_bus subsystem (net/unix/sysctl_net_unix.c).
++ *
++ */
++
++#include <linux/mm.h>
++#include <linux/slab.h>
++#include <linux/sysctl.h>
++
++#include <net/af_bus.h>
++
++static ctl_table bus_table[] = {
++	{
++		.procname	= "max_dgram_qlen",
++		.data		= &init_net.unx.sysctl_max_dgram_qlen,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec
++	},
++	{ }
++};
++
++static struct ctl_path bus_path[] = {
++	{ .procname = "net", },
++	{ .procname = "bus", },
++	{ },
++};
++
++int __net_init bus_sysctl_register(struct net *net)
++{
++	struct ctl_table *table;
++
++	table = kmemdup(bus_table, sizeof(bus_table), GFP_KERNEL);
++	if (table == NULL)
++		goto err_alloc;
++
++	table[0].data = &net->unx.sysctl_max_dgram_qlen;
++	net->unx.ctl = register_net_sysctl_table(net, bus_path, table);
++	if (net->unx.ctl == NULL)
++		goto err_reg;
++
++	return 0;
++
++err_reg:
++	kfree(table);
++err_alloc:
++	return -ENOMEM;
++}
++
++void bus_sysctl_unregister(struct net *net)
++{
++	struct ctl_table *table;
++
++	table = net->unx.ctl->ctl_table_arg;
++	unregister_sysctl_table(net->unx.ctl);
++	kfree(table);
++}
+diff --git a/net/core/scm.c b/net/core/scm.c
+index ff52ad0..2bb1cb1 100644
+--- a/net/core/scm.c
++++ b/net/core/scm.c
+@@ -159,7 +159,8 @@ int __scm_send(struct socket *sock, struct msghdr *msg, struct scm_cookie *p)
+ 		switch (cmsg->cmsg_type)
+ 		{
+ 		case SCM_RIGHTS:
+-			if (!sock->ops || sock->ops->family != PF_UNIX)
++			if (!sock->ops || (sock->ops->family != PF_UNIX &&
++					   sock->ops->family != PF_BUS))
+ 				goto error;
+ 			err=scm_fp_copy(cmsg, &p->fp);
+ 			if (err<0)
+diff --git a/net/core/sock.c b/net/core/sock.c
+index aebb419..1803b9a 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -158,7 +158,7 @@ static const char *const af_family_key_strings[AF_MAX+1] = {
+   "sk_lock-AF_TIPC"  , "sk_lock-AF_BLUETOOTH", "sk_lock-IUCV"        ,
+   "sk_lock-AF_RXRPC" , "sk_lock-AF_ISDN"     , "sk_lock-AF_PHONET"   ,
+   "sk_lock-AF_IEEE802154", "sk_lock-AF_CAIF" , "sk_lock-AF_ALG"      ,
+-  "sk_lock-AF_MAX"
++  "sk_lock-AF_NFC"   , "sk_lock-AF_BUS"      , "sk_lock-AF_MAX"
+ };
+ static const char *const af_family_slock_key_strings[AF_MAX+1] = {
+   "slock-AF_UNSPEC", "slock-AF_UNIX"     , "slock-AF_INET"     ,
+@@ -174,7 +174,7 @@ static const char *const af_family_slock_key_strings[AF_MAX+1] = {
+   "slock-AF_TIPC"  , "slock-AF_BLUETOOTH", "slock-AF_IUCV"     ,
+   "slock-AF_RXRPC" , "slock-AF_ISDN"     , "slock-AF_PHONET"   ,
+   "slock-AF_IEEE802154", "slock-AF_CAIF" , "slock-AF_ALG"      ,
+-  "slock-AF_MAX"
++  "slock-AF_NFC"   , "slock-AF_BUS"      , "slock-AF_MAX"
+ };
+ static const char *const af_family_clock_key_strings[AF_MAX+1] = {
+   "clock-AF_UNSPEC", "clock-AF_UNIX"     , "clock-AF_INET"     ,
+@@ -190,7 +190,7 @@ static const char *const af_family_clock_key_strings[AF_MAX+1] = {
+   "clock-AF_TIPC"  , "clock-AF_BLUETOOTH", "clock-AF_IUCV"     ,
+   "clock-AF_RXRPC" , "clock-AF_ISDN"     , "clock-AF_PHONET"   ,
+   "clock-AF_IEEE802154", "clock-AF_CAIF" , "clock-AF_ALG"      ,
+-  "clock-AF_MAX"
++  "clock-AF_NFC"   , "clock-AF_BUS"      , "clock-AF_MAX"
+ };
+ 
+ /*
+diff --git a/net/decnet/netfilter/dn_rtmsg.c b/net/decnet/netfilter/dn_rtmsg.c
+index 64a7f39..24d2677 100644
+--- a/net/decnet/netfilter/dn_rtmsg.c
++++ b/net/decnet/netfilter/dn_rtmsg.c
+@@ -118,7 +118,7 @@ static inline void dnrmg_receive_user_skb(struct sk_buff *skb)
+ 
+ static struct nf_hook_ops dnrmg_ops __read_mostly = {
+ 	.hook		= dnrmg_hook,
+-	.pf		= PF_DECnet,
++	.pf		= NFPROTO_DECNET,
+ 	.hooknum	= NF_DN_ROUTE,
+ 	.priority	= NF_DN_PRI_DNRTMSG,
+ };
+diff --git a/net/netfilter/Kconfig b/net/netfilter/Kconfig
+index 32bff6d..44db9be 100644
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -1086,3 +1086,5 @@ endmenu
+ source "net/netfilter/ipset/Kconfig"
+ 
+ source "net/netfilter/ipvs/Kconfig"
++
++source "net/netfilter/nfdbus/Kconfig"
+diff --git a/net/netfilter/Makefile b/net/netfilter/Makefile
+index 1a02853..02aad43 100644
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@ -113,3 +113,6 @@ obj-$(CONFIG_IP_SET) += ipset/
+ 
+ # IPVS
+ obj-$(CONFIG_IP_VS) += ipvs/
++
++# Dbus
++obj-$(CONFIG_NETFILTER_DBUS) += nfdbus/
+diff --git a/net/netfilter/core.c b/net/netfilter/core.c
+index 899b71c..c13e285 100644
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -61,6 +61,11 @@ int nf_register_hook(struct nf_hook_ops *reg)
+ 	struct nf_hook_ops *elem;
+ 	int err;
+ 
++	if (reg->pf > NFPROTO_NUMPROTO || reg->hooknum > NF_MAX_HOOKS) {
++		BUG();
++		return 1;
++	}
++
+ 	err = mutex_lock_interruptible(&nf_hook_mutex);
+ 	if (err < 0)
+ 		return err;
+diff --git a/net/netfilter/nfdbus/Kconfig b/net/netfilter/nfdbus/Kconfig
+new file mode 100644
+index 0000000..7748208
+--- /dev/null
++++ b/net/netfilter/nfdbus/Kconfig
+@@ -0,0 +1,12 @@
++#
++# Netfilter D-Bus module configuration
++#
++config NETFILTER_DBUS
++	tristate "Netfilter D-bus"
++	depends on BUS
++	---help---
++	  If you say Y here, you will include support for a netfilter hook to
++	  parse D-Bus messages sent using the AF_BUS socket address family.
++
++	  To compile this as a module, choose M here: the module will be
++	  called netfilter_dbus.
+diff --git a/net/netfilter/nfdbus/Makefile b/net/netfilter/nfdbus/Makefile
+new file mode 100644
+index 0000000..1a825f8
+--- /dev/null
++++ b/net/netfilter/nfdbus/Makefile
+@@ -0,0 +1,6 @@
++#
++# Makefile for the netfilter D-Bus module
++#
++obj-$(CONFIG_NETFILTER_DBUS) += netfilter_dbus.o
++
++netfilter_dbus-y := nfdbus.o message.o matchrule.o
+diff --git a/net/netfilter/nfdbus/dbus-protocol.h b/net/netfilter/nfdbus/dbus-protocol.h
+new file mode 100644
+index 0000000..c45a522
+--- /dev/null
++++ b/net/netfilter/nfdbus/dbus-protocol.h
+@@ -0,0 +1,473 @@
++/*
++ * dbus-protocol.h  D-Bus protocol constants
++ *
++ * Copyright (C) 2002, 2003  CodeFactory AB
++ * Copyright (C) 2004, 2005 Red Hat, Inc.
++ *
++ * Licensed under the Academic Free License version 2.1
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ */
++
++#ifndef DBUS_PROTOCOL_H
++#define DBUS_PROTOCOL_H
++
++/* Don't include anything in here from anywhere else. It's
++ * intended for use by any random library.
++ */
++
++#ifdef __cplusplus
++extern "C" {
++#if 0
++} /* avoids confusing emacs indentation */
++#endif
++#endif
++
++/* Normally docs are in .c files, but there isn't a .c file for this. */
++/**
++ * @defgroup DBusProtocol Protocol constants
++ * @ingroup  DBus
++ *
++ * @brief Defines constants which are part of the D-Bus protocol
++ *
++ * This header is intended for use by any library, not only libdbus.
++ *
++ * @{
++ */
++
++
++/* Message byte order */
++/* Code marking LSB-first byte order in the wire protocol. */
++#define DBUS_LITTLE_ENDIAN ('l')
++/* Code marking MSB-first byte order in the wire protocol. */
++#define DBUS_BIG_ENDIAN    ('B')
++
++/** Protocol version. */
++#define DBUS_MAJOR_PROTOCOL_VERSION 1
++
++/** Type code that is never equal to a legitimate type code */
++#define DBUS_TYPE_INVALID       ((int) '\0')
++/** #DBUS_TYPE_INVALID as a string literal instead of a int literal */
++#define DBUS_TYPE_INVALID_AS_STRING        "\0"
++
++/* Primitive types */
++/** Type code marking an 8-bit unsigned integer */
++#define DBUS_TYPE_BYTE          ((int) 'y')
++/** #DBUS_TYPE_BYTE as a string literal instead of a int literal */
++#define DBUS_TYPE_BYTE_AS_STRING           "y"
++/** Type code marking a boolean */
++#define DBUS_TYPE_BOOLEAN       ((int) 'b')
++/** #DBUS_TYPE_BOOLEAN as a string literal instead of a int literal */
++#define DBUS_TYPE_BOOLEAN_AS_STRING        "b"
++/** Type code marking a 16-bit signed integer */
++#define DBUS_TYPE_INT16         ((int) 'n')
++/** #DBUS_TYPE_INT16 as a string literal instead of a int literal */
++#define DBUS_TYPE_INT16_AS_STRING          "n"
++/** Type code marking a 16-bit unsigned integer */
++#define DBUS_TYPE_UINT16        ((int) 'q')
++/** #DBUS_TYPE_UINT16 as a string literal instead of a int literal */
++#define DBUS_TYPE_UINT16_AS_STRING         "q"
++/** Type code marking a 32-bit signed integer */
++#define DBUS_TYPE_INT32         ((int) 'i')
++/** #DBUS_TYPE_INT32 as a string literal instead of a int literal */
++#define DBUS_TYPE_INT32_AS_STRING          "i"
++/** Type code marking a 32-bit unsigned integer */
++#define DBUS_TYPE_UINT32        ((int) 'u')
++/** #DBUS_TYPE_UINT32 as a string literal instead of a int literal */
++#define DBUS_TYPE_UINT32_AS_STRING         "u"
++/** Type code marking a 64-bit signed integer */
++#define DBUS_TYPE_INT64         ((int) 'x')
++/** #DBUS_TYPE_INT64 as a string literal instead of a int literal */
++#define DBUS_TYPE_INT64_AS_STRING          "x"
++/** Type code marking a 64-bit unsigned integer */
++#define DBUS_TYPE_UINT64        ((int) 't')
++/** #DBUS_TYPE_UINT64 as a string literal instead of a int literal */
++#define DBUS_TYPE_UINT64_AS_STRING         "t"
++/** Type code marking an 8-byte double in IEEE 754 format */
++#define DBUS_TYPE_DOUBLE        ((int) 'd')
++/** #DBUS_TYPE_DOUBLE as a string literal instead of a int literal */
++#define DBUS_TYPE_DOUBLE_AS_STRING         "d"
++/** Type code marking a UTF-8 encoded, nul-terminated Unicode string */
++#define DBUS_TYPE_STRING        ((int) 's')
++/** #DBUS_TYPE_STRING as a string literal instead of a int literal */
++#define DBUS_TYPE_STRING_AS_STRING         "s"
++/** Type code marking a D-Bus object path */
++#define DBUS_TYPE_OBJECT_PATH   ((int) 'o')
++/** #DBUS_TYPE_OBJECT_PATH as a string literal instead of a int literal */
++#define DBUS_TYPE_OBJECT_PATH_AS_STRING    "o"
++/** Type code marking a D-Bus type signature */
++#define DBUS_TYPE_SIGNATURE     ((int) 'g')
++/** #DBUS_TYPE_SIGNATURE as a string literal instead of a int literal */
++#define DBUS_TYPE_SIGNATURE_AS_STRING      "g"
++/** Type code marking a unix file descriptor */
++#define DBUS_TYPE_UNIX_FD      ((int) 'h')
++/** #DBUS_TYPE_UNIX_FD as a string literal instead of a int literal */
++#define DBUS_TYPE_UNIX_FD_AS_STRING        "h"
++
++/* Compound types */
++/** Type code marking a D-Bus array type */
++#define DBUS_TYPE_ARRAY         ((int) 'a')
++/** #DBUS_TYPE_ARRAY as a string literal instead of a int literal */
++#define DBUS_TYPE_ARRAY_AS_STRING          "a"
++/** Type code marking a D-Bus variant type */
++#define DBUS_TYPE_VARIANT       ((int) 'v')
++/** #DBUS_TYPE_VARIANT as a string literal instead of a int literal */
++#define DBUS_TYPE_VARIANT_AS_STRING        "v"
++
++/** STRUCT and DICT_ENTRY are sort of special since their codes can't
++ * appear in a type string, instead
++ * DBUS_STRUCT_BEGIN_CHAR/DBUS_DICT_ENTRY_BEGIN_CHAR have to appear
++ */
++/** Type code used to represent a struct; however, this type code does not
++ * appear in type signatures, instead #DBUS_STRUCT_BEGIN_CHAR and
++ * #DBUS_STRUCT_END_CHAR will appear in a signature.
++ */
++#define DBUS_TYPE_STRUCT        ((int) 'r')
++/** #DBUS_TYPE_STRUCT as a string literal instead of a int literal */
++#define DBUS_TYPE_STRUCT_AS_STRING         "r"
++/** Type code used to represent a dict entry; however, this type code does not
++ * appear in type signatures, instead #DBUS_DICT_ENTRY_BEGIN_CHAR and
++ * #DBUS_DICT_ENTRY_END_CHAR will appear in a signature.
++ */
++#define DBUS_TYPE_DICT_ENTRY    ((int) 'e')
++/** #DBUS_TYPE_DICT_ENTRY as a string literal instead of a int literal */
++#define DBUS_TYPE_DICT_ENTRY_AS_STRING     "e"
++
++/** Does not include #DBUS_TYPE_INVALID, #DBUS_STRUCT_BEGIN_CHAR,
++ * #DBUS_STRUCT_END_CHAR, #DBUS_DICT_ENTRY_BEGIN_CHAR, or
++ * #DBUS_DICT_ENTRY_END_CHAR - i.e. it is the number of valid types, not the
++ * number of distinct characters that may appear in a type signature.
++ */
++#define DBUS_NUMBER_OF_TYPES    (16)
++
++/* characters other than typecodes that appear in type signatures */
++
++/** Code marking the start of a struct type in a type signature */
++#define DBUS_STRUCT_BEGIN_CHAR   ((int) '(')
++/** #DBUS_STRUCT_BEGIN_CHAR as a string literal instead of a int literal */
++#define DBUS_STRUCT_BEGIN_CHAR_AS_STRING   "("
++/** Code marking the end of a struct type in a type signature */
++#define DBUS_STRUCT_END_CHAR     ((int) ')')
++/** #DBUS_STRUCT_END_CHAR a string literal instead of a int literal */
++#define DBUS_STRUCT_END_CHAR_AS_STRING     ")"
++/** Code marking the start of a dict entry type in a type signature */
++#define DBUS_DICT_ENTRY_BEGIN_CHAR   ((int) '{')
++/** #DBUS_DICT_ENTRY_BEGIN_CHAR as a string literal instead of a int literal */
++#define DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING   "{"
++/** Code marking the end of a dict entry type in a type signature */
++#define DBUS_DICT_ENTRY_END_CHAR     ((int) '}')
++/** #DBUS_DICT_ENTRY_END_CHAR as a string literal instead of a int literal */
++#define DBUS_DICT_ENTRY_END_CHAR_AS_STRING     "}"
++
++/** Max length in bytes of a bus name, interface, or member (not object
++ * path, paths are unlimited). This is limited because lots of stuff
++ * is O(n) in this number, plus it would be obnoxious to type in a
++ * paragraph-long method name so most likely something like that would
++ * be an exploit.
++ */
++#define DBUS_MAXIMUM_NAME_LENGTH 255
++
++/** This one is 255 so it fits in a byte */
++#define DBUS_MAXIMUM_SIGNATURE_LENGTH 255
++
++/** Max length of a match rule string; to keep people from hosing the
++ * daemon with some huge rule
++ */
++#define DBUS_MAXIMUM_MATCH_RULE_LENGTH 1024
++
++/** Max arg number you can match on in a match rule, e.g.
++ * arg0='hello' is OK, arg3489720987='hello' is not
++ */
++#define DBUS_MAXIMUM_MATCH_RULE_ARG_NUMBER 63
++
++/** Max length of a marshaled array in bytes (64M, 2^26) We use signed
++ * int for lengths so must be INT_MAX or less.  We need something a
++ * bit smaller than INT_MAX because the array is inside a message with
++ * header info, etc.  so an INT_MAX array wouldn't allow the message
++ * overhead.  The 64M number is an attempt at a larger number than
++ * we'd reasonably ever use, but small enough that your bus would chew
++ * through it fairly quickly without locking up forever. If you have
++ * data that's likely to be larger than this, you should probably be
++ * sending it in multiple incremental messages anyhow.
++ */
++#define DBUS_MAXIMUM_ARRAY_LENGTH (67108864)
++/** Number of bits you need in an unsigned to store the max array size */
++#define DBUS_MAXIMUM_ARRAY_LENGTH_BITS 26
++
++/** The maximum total message size including header and body; similar
++ * rationale to max array size.
++ */
++#define DBUS_MAXIMUM_MESSAGE_LENGTH (DBUS_MAXIMUM_ARRAY_LENGTH * 2)
++/** Number of bits you need in an unsigned to store the max message size */
++#define DBUS_MAXIMUM_MESSAGE_LENGTH_BITS 27
++
++/** The maximum total number of unix fds in a message. Similar
++ * rationale as DBUS_MAXIMUM_MESSAGE_LENGTH. However we divide by four
++ * given that one fd is an int and hence at least 32 bits.
++ */
++#define DBUS_MAXIMUM_MESSAGE_UNIX_FDS (DBUS_MAXIMUM_MESSAGE_LENGTH/4)
++/** Number of bits you need in an unsigned to store the max message unix fds */
++#define DBUS_MAXIMUM_MESSAGE_UNIX_FDS_BITS (DBUS_MAXIMUM_MESSAGE_LENGTH_BITS-2)
++
++/** Depth of recursion in the type tree. This is automatically limited
++ * to DBUS_MAXIMUM_SIGNATURE_LENGTH since you could only have an array
++ * of array of array of ... that fit in the max signature.  But that's
++ * probably a bit too large.
++ */
++#define DBUS_MAXIMUM_TYPE_RECURSION_DEPTH 32
++
++/* Types of message */
++
++/** This value is never a valid message type, see dbus_message_get_type() */
++#define DBUS_MESSAGE_TYPE_INVALID       0
++/** Message type of a method call message, see dbus_message_get_type() */
++#define DBUS_MESSAGE_TYPE_METHOD_CALL   1
++/** Message type of a method return message, see dbus_message_get_type() */
++#define DBUS_MESSAGE_TYPE_METHOD_RETURN 2
++/** Message type of an error reply message, see dbus_message_get_type() */
++#define DBUS_MESSAGE_TYPE_ERROR         3
++/** Message type of a signal message, see dbus_message_get_type() */
++#define DBUS_MESSAGE_TYPE_SIGNAL        4
++
++#define DBUS_NUM_MESSAGE_TYPES          5
++
++/* Header flags */
++
++/** If set, this flag means that the sender of a message does not care about
++ * getting a reply, so the recipient need not send one.
++ * See dbus_message_set_no_reply().
++ */
++#define DBUS_HEADER_FLAG_NO_REPLY_EXPECTED 0x1
++/**
++ * If set, this flag means that even if the message bus knows how to start an owner for
++ * the destination bus name (see dbus_message_set_destination()), it should not
++ * do so. If this flag is not set, the bus may launch a program to process the
++ * message.
++ */
++#define DBUS_HEADER_FLAG_NO_AUTO_START     0x2
++
++/* Header fields */
++
++/** Not equal to any valid header field code */
++#define DBUS_HEADER_FIELD_INVALID        0
++/** Header field code for the path - the path is the object emitting a signal or
++ * the object receiving a method call.
++ * See dbus_message_set_path().
++ */
++#define DBUS_HEADER_FIELD_PATH           1
++/** Header field code for the interface containing a member (method or signal).
++ * See dbus_message_set_interface().
++ */
++#define DBUS_HEADER_FIELD_INTERFACE      2
++/** Header field code for a member (method or signal).
++ * See dbus_message_set_member().
++ */
++#define DBUS_HEADER_FIELD_MEMBER         3
++/** Header field code for an error name (found in #DBUS_MESSAGE_TYPE_ERROR
++ * messages).
++ * See dbus_message_set_error_name().
++ */
++#define DBUS_HEADER_FIELD_ERROR_NAME     4
++/** Header field code for a reply serial, used to match a
++ * #DBUS_MESSAGE_TYPE_METHOD_RETURN message with the message that it's a reply to.
++ * See dbus_message_set_reply_serial().
++ */
++#define DBUS_HEADER_FIELD_REPLY_SERIAL   5
++/**
++ * Header field code for the destination bus name of a message. See dbus_message_set_destination().
++ */
++#define DBUS_HEADER_FIELD_DESTINATION    6
++/**
++ * Header field code for the sender of a message; usually initialized by the message bus.
++ * See dbus_message_set_sender().
++ */
++#define DBUS_HEADER_FIELD_SENDER         7
++/**
++ * Header field code for the type signature of a message.
++ */
++#define DBUS_HEADER_FIELD_SIGNATURE      8
++/**
++ * Header field code for the number of unix file descriptors associated
++ * with this message.
++ */
++#define DBUS_HEADER_FIELD_UNIX_FDS       9
++
++
++/**
++ * Value of the highest-numbered header field code, can be used to determine
++ * the size of an array indexed by header field code. Remember though
++ * that unknown codes must be ignored, so check for that before
++ * indexing the array.
++ */
++#define DBUS_HEADER_FIELD_LAST DBUS_HEADER_FIELD_UNIX_FDS
++
++/** Header format is defined as a signature:
++ *   byte                            byte order
++ *   byte                            message type ID
++ *   byte                            flags
++ *   byte                            protocol version
++ *   uint32                          body length
++ *   uint32                          serial
++ *   array of struct (byte,variant)  (field name, value)
++ *
++ * The length of the header can be computed as the
++ * fixed size of the initial data, plus the length of
++ * the array at the end, plus padding to an 8-boundary.
++ */
++#define DBUS_HEADER_SIGNATURE                   \
++	(DBUS_TYPE_BYTE_AS_STRING		\
++	DBUS_TYPE_BYTE_AS_STRING		\
++	DBUS_TYPE_BYTE_AS_STRING		\
++	DBUS_TYPE_BYTE_AS_STRING		\
++	DBUS_TYPE_UINT32_AS_STRING		\
++	DBUS_TYPE_UINT32_AS_STRING		\
++	DBUS_TYPE_ARRAY_AS_STRING		\
++	DBUS_STRUCT_BEGIN_CHAR_AS_STRING	\
++	DBUS_TYPE_BYTE_AS_STRING		\
++	DBUS_TYPE_VARIANT_AS_STRING		\
++	 DBUS_STRUCT_END_CHAR_AS_STRING)
++
++
++/**
++ * The smallest header size that can occur.  (It won't be valid due to
++ * missing required header fields.) This is 4 bytes, two uint32, an
++ * array length. This isn't any kind of resource limit, just the
++ * necessary/logical outcome of the header signature.
++ */
++#define DBUS_MINIMUM_HEADER_SIZE 16
++
++/* Errors */
++/* WARNING these get autoconverted to an enum in dbus-glib.h. Thus,
++ * if you change the order it breaks the ABI. Keep them in order.
++ * Also, don't change the formatting since that will break the sed
++ * script.
++ */
++/** A generic error; "something went wrong" - see the error message for more. */
++#define DBUS_ERROR_FAILED                     "org.freedesktop.DBus.Error.Failed"
++/** There was not enough memory to complete an operation. */
++#define DBUS_ERROR_NO_MEMORY                  "org.freedesktop.DBus.Error.NoMemory"
++/** The bus doesn't know how to launch a service to supply the bus name you
++ * wanted.
++ */
++#define DBUS_ERROR_SERVICE_UNKNOWN   "org.freedesktop.DBus.Error.ServiceUnknown"
++/** The bus name you referenced doesn't exist (i.e. no application owns it). */
++#define DBUS_ERROR_NAME_HAS_NO_OWNER          "org.freedesktop.DBus.Error.NameHasNoOwner"
++/** No reply to a message expecting one, usually means a timeout occurred. */
++#define DBUS_ERROR_NO_REPLY                   "org.freedesktop.DBus.Error.NoReply"
++/** Something went wrong reading or writing to a socket, for example. */
++#define DBUS_ERROR_IO_ERROR                   "org.freedesktop.DBus.Error.IOError"
++/** A D-Bus bus address was malformed. */
++#define DBUS_ERROR_BAD_ADDRESS                "org.freedesktop.DBus.Error.BadAddress"
++/** Requested operation isn't supported (like ENOSYS on UNIX). */
++#define DBUS_ERROR_NOT_SUPPORTED              "org.freedesktop.DBus.Error.NotSupported"
++/** Some limited resource is exhausted. */
++#define DBUS_ERROR_LIMITS_EXCEEDED            "org.freedesktop.DBus.Error.LimitsExceeded"
++/** Security restrictions don't allow doing what you're trying to do. */
++#define DBUS_ERROR_ACCESS_DENIED              "org.freedesktop.DBus.Error.AccessDenied"
++/** Authentication didn't work. */
++#define DBUS_ERROR_AUTH_FAILED                "org.freedesktop.DBus.Error.AuthFailed"
++/* Unable to connect to server (probably caused by ECONNREFUSED on a socket). */
++#define DBUS_ERROR_NO_SERVER               "org.freedesktop.DBus.Error.NoServer"
++/** Certain timeout errors, possibly ETIMEDOUT on a socket.
++ * Note that #DBUS_ERROR_NO_REPLY is used for message reply timeouts.
++ * @warning this is confusingly-named given that #DBUS_ERROR_TIMED_OUT also exists. We can't fix
++ * it for compatibility reasons so just be careful.
++ */
++#define DBUS_ERROR_TIMEOUT                  "org.freedesktop.DBus.Error.Timeout"
++/** No network access (probably ENETUNREACH on a socket). */
++#define DBUS_ERROR_NO_NETWORK                 "org.freedesktop.DBus.Error.NoNetwork"
++/** Can't bind a socket since its address is in use (i.e. EADDRINUSE). */
++#define DBUS_ERROR_ADDRESS_IN_USE             "org.freedesktop.DBus.Error.AddressInUse"
++/** The connection is disconnected and you're trying to use it. */
++#define DBUS_ERROR_DISCONNECTED               "org.freedesktop.DBus.Error.Disconnected"
++/** Invalid arguments passed to a method call. */
++#define DBUS_ERROR_INVALID_ARGS               "org.freedesktop.DBus.Error.InvalidArgs"
++/** Missing file. */
++#define DBUS_ERROR_FILE_NOT_FOUND             "org.freedesktop.DBus.Error.FileNotFound"
++/** Existing file and the operation you're using does not silently overwrite. */
++#define DBUS_ERROR_FILE_EXISTS                "org.freedesktop.DBus.Error.FileExists"
++/** Method name you invoked isn't known by the object you invoked it on. */
++#define DBUS_ERROR_UNKNOWN_METHOD             "org.freedesktop.DBus.Error.UnknownMethod"
++/** Certain timeout errors, e.g. while starting a service.
++ * @warning this is confusingly-named given that #DBUS_ERROR_TIMEOUT also exists. We can't fix
++ * it for compatibility reasons so just be careful.
++ */
++#define DBUS_ERROR_TIMED_OUT               "org.freedesktop.DBus.Error.TimedOut"
++/** Tried to remove or modify a match rule that didn't exist. */
++#define DBUS_ERROR_MATCH_RULE_NOT_FOUND       "org.freedesktop.DBus.Error.MatchRuleNotFound"
++/** The match rule isn't syntactically valid. */
++#define DBUS_ERROR_MATCH_RULE_INVALID         "org.freedesktop.DBus.Error.MatchRuleInvalid"
++/** While starting a new process, the exec() call failed. */
++#define DBUS_ERROR_SPAWN_EXEC_FAILED          "org.freedesktop.DBus.Error.Spawn.ExecFailed"
++/** While starting a new process, the fork() call failed. */
++#define DBUS_ERROR_SPAWN_FORK_FAILED          "org.freedesktop.DBus.Error.Spawn.ForkFailed"
++/** While starting a new process, the child exited with a status code. */
++#define DBUS_ERROR_SPAWN_CHILD_EXITED         "org.freedesktop.DBus.Error.Spawn.ChildExited"
++/** While starting a new process, the child exited on a signal. */
++#define DBUS_ERROR_SPAWN_CHILD_SIGNALED       "org.freedesktop.DBus.Error.Spawn.ChildSignaled"
++/** While starting a new process, something went wrong. */
++#define DBUS_ERROR_SPAWN_FAILED               "org.freedesktop.DBus.Error.Spawn.Failed"
++/** We failed to setup the environment correctly. */
++#define DBUS_ERROR_SPAWN_SETUP_FAILED         "org.freedesktop.DBus.Error.Spawn.FailedToSetup"
++/** We failed to setup the config parser correctly. */
++#define DBUS_ERROR_SPAWN_CONFIG_INVALID       "org.freedesktop.DBus.Error.Spawn.ConfigInvalid"
++/** Bus name was not valid. */
++#define DBUS_ERROR_SPAWN_SERVICE_INVALID      "org.freedesktop.DBus.Error.Spawn.ServiceNotValid"
++/** Service file not found in system-services directory. */
++#define DBUS_ERROR_SPAWN_SERVICE_NOT_FOUND    "org.freedesktop.DBus.Error.Spawn.ServiceNotFound"
++/** Permissions are incorrect on the setuid helper. */
++#define DBUS_ERROR_SPAWN_PERMISSIONS_INVALID  "org.freedesktop.DBus.Error.Spawn.PermissionsInvalid"
++/** Service file invalid (Name, User or Exec missing). */
++#define DBUS_ERROR_SPAWN_FILE_INVALID         "org.freedesktop.DBus.Error.Spawn.FileInvalid"
++/** Tried to get a UNIX process ID and it wasn't available. */
++#define DBUS_ERROR_SPAWN_NO_MEMORY            "org.freedesktop.DBus.Error.Spawn.NoMemory"
++/** Tried to get a UNIX process ID and it wasn't available. */
++#define DBUS_ERROR_UNIX_PROCESS_ID_UNKNOWN    "org.freedesktop.DBus.Error.UnixProcessIdUnknown"
++/** A type signature is not valid. */
++#define DBUS_ERROR_INVALID_SIGNATURE          "org.freedesktop.DBus.Error.InvalidSignature"
++/** A file contains invalid syntax or is otherwise broken. */
++#define DBUS_ERROR_INVALID_FILE_CONTENT       "org.freedesktop.DBus.Error.InvalidFileContent"
++/** Asked for SELinux security context and it wasn't available. */
++#define DBUS_ERROR_SELINUX_SECURITY_CONTEXT_UNKNOWN    "org.freedesktop.DBus.Error.SELinuxSecurityContextUnknown"
++/** Asked for ADT audit data and it wasn't available. */
++#define DBUS_ERROR_ADT_AUDIT_DATA_UNKNOWN     "org.freedesktop.DBus.Error.AdtAuditDataUnknown"
++/** There's already an object with the requested object path. */
++#define DBUS_ERROR_OBJECT_PATH_IN_USE         "org.freedesktop.DBus.Error.ObjectPathInUse"
++/** The message meta data does not match the payload. e.g. expected
++    number of file descriptors were not sent over the socket this message was received on. */
++#define DBUS_ERROR_INCONSISTENT_MESSAGE       "org.freedesktop.DBus.Error.InconsistentMessage"
++
++/* XML introspection format */
++
++/** XML namespace of the introspection format version 1.0 */
++#define DBUS_INTROSPECT_1_0_XML_NAMESPACE         "http://www.freedesktop.org/standards/dbus"
++/** XML public identifier of the introspection format version 1.0 */
++#define DBUS_INTROSPECT_1_0_XML_PUBLIC_IDENTIFIER "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
++/** XML system identifier of the introspection format version 1.0 */
++#define DBUS_INTROSPECT_1_0_XML_SYSTEM_IDENTIFIER "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd"
++/** XML document type declaration of the introspection format version 1.0 */
++#define DBUS_INTROSPECT_1_0_XML_DOCTYPE_DECL_NODE "<!DOCTYPE node PUBLIC \""DBUS_INTROSPECT_1_0_XML_PUBLIC_IDENTIFIER"\"\n\""DBUS_INTROSPECT_1_0_XML_SYSTEM_IDENTIFIER"\">\n"
++
++/** @} */
++
++#ifdef __cplusplus
++#if 0
++{ /* avoids confusing emacs indentation */
++#endif
++}
++#endif
++
++#endif /* DBUS_PROTOCOL_H */
+diff --git a/net/netfilter/nfdbus/matchrule.c b/net/netfilter/nfdbus/matchrule.c
+new file mode 100644
+index 0000000..504eed0
+--- /dev/null
++++ b/net/netfilter/nfdbus/matchrule.c
+@@ -0,0 +1,1224 @@
++/*
++ * matchrule.c  D-Bus match rule implementation
++ *
++ * Based on signals.c from dbus
++ *
++ * Copyright (C) 2010  Collabora, Ltd.
++ * Copyright (C) 2003, 2005  Red Hat, Inc.
++ *
++ * Licensed under the Academic Free License version 2.1
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ */
++
++#include "matchrule.h"
++
++#include <linux/rbtree.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++
++#include "dbus-protocol.h"
++#include "message.h"
++
++enum bus_match_flags {
++	BUS_MATCH_MESSAGE_TYPE            = 1 << 0,
++	BUS_MATCH_INTERFACE               = 1 << 1,
++	BUS_MATCH_MEMBER                  = 1 << 2,
++	BUS_MATCH_SENDER                  = 1 << 3,
++	BUS_MATCH_DESTINATION             = 1 << 4,
++	BUS_MATCH_PATH                    = 1 << 5,
++	BUS_MATCH_ARGS                    = 1 << 6,
++	BUS_MATCH_PATH_NAMESPACE          = 1 << 7,
++	BUS_MATCH_CLIENT_IS_EAVESDROPPING = 1 << 8
++};
++
++struct bus_match_rule {
++        /* For debugging only*/
++        char *rule_text;
++
++	unsigned int flags; /**< BusMatchFlags */
++
++	int   message_type;
++	char *interface;
++	char *member;
++	char *sender;
++	char *destination;
++	char *path;
++
++	unsigned int *arg_lens;
++	char **args;
++	int args_len;
++
++	/* bus_match_rule is attached to rule_pool, either in a simple
++	 * double-linked list if the rule does not have any interface, or in a
++	 * red-black tree sorted by interface. If several rules can have the
++	 * same interface, the first one is attached with struct rb_node and the
++	 * next ones are in the list
++	 */
++
++	struct rb_node node;
++	/* Doubly-linked non-circular list. If the rule has an interface, it is
++	 * in the rb tree and the single head is right here. Otherwise, the
++	 * single head is in rule_pool->rules_without_iface. With this data
++	 * structure, we don't need any allocation to insert or remove the rule.
++	 */
++	struct hlist_head first;
++	struct hlist_node list;
++
++	/* used to delete all names from the tree */
++	struct list_head del_list;
++};
++
++struct dbus_name {
++	struct rb_node node;
++	char *name;
++
++	/* used to delete all names from the tree */
++	struct list_head del_list;
++};
++
++#define BUS_MATCH_ARG_IS_PATH  0x8000000u
++
++#define DBUS_STRING_MAX_LENGTH 1024
++
++/** Max length of a match rule string; to keep people from hosing the
++ * daemon with some huge rule
++ */
++#define DBUS_MAXIMUM_MATCH_RULE_LENGTH 1024
++
++struct bus_match_rule *bus_match_rule_new(gfp_t gfp_flags)
++{
++	struct bus_match_rule *rule;
++
++	rule = kzalloc(sizeof(struct bus_match_rule), gfp_flags);
++	if (rule == NULL)
++		return NULL;
++
++	return rule;
++}
++
++void bus_match_rule_free(struct bus_match_rule *rule)
++{
++	if (rule->rule_text)
++		kfree(rule->rule_text);
++	if (rule->interface)
++		kfree(rule->interface);
++	if (rule->member)
++		kfree(rule->member);
++	if (rule->sender)
++		kfree(rule->sender);
++	if (rule->destination)
++		kfree(rule->destination);
++	if (rule->path)
++		kfree(rule->path);
++	if (rule->arg_lens)
++		kfree(rule->arg_lens);
++
++	/* can't use dbus_free_string_array() since there
++	 * are embedded NULL
++	 */
++	if (rule->args) {
++		int i;
++
++		i = 0;
++		while (i < rule->args_len) {
++			if (rule->args[i])
++				kfree(rule->args[i]);
++			++i;
++		}
++
++		kfree(rule->args);
++	}
++
++	kfree(rule);
++}
++
++static int
++bus_match_rule_set_message_type(struct bus_match_rule *rule,
++				int type,
++				gfp_t gfp_flags)
++{
++	rule->flags |= BUS_MATCH_MESSAGE_TYPE;
++
++	rule->message_type = type;
++
++	return 1;
++}
++
++static int
++bus_match_rule_set_interface(struct bus_match_rule *rule,
++			     const char *interface,
++			     gfp_t gfp_flags)
++{
++	char *new;
++
++	WARN_ON(!interface);
++
++	new = kstrdup(interface, gfp_flags);
++	if (new == NULL)
++		return 0;
++
++	rule->flags |= BUS_MATCH_INTERFACE;
++	kfree(rule->interface);
++	rule->interface = new;
++
++	return 1;
++}
++
++static int
++bus_match_rule_set_member(struct bus_match_rule *rule,
++			  const char *member,
++			  gfp_t gfp_flags)
++{
++	char *new;
++
++	WARN_ON(!member);
++
++	new = kstrdup(member, gfp_flags);
++	if (new == NULL)
++		return 0;
++
++	rule->flags |= BUS_MATCH_MEMBER;
++	kfree(rule->member);
++	rule->member = new;
++
++	return 1;
++}
++
++static int
++bus_match_rule_set_sender(struct bus_match_rule *rule,
++			  const char *sender,
++			  gfp_t gfp_flags)
++{
++	char *new;
++
++	WARN_ON(!sender);
++
++	new = kstrdup(sender, gfp_flags);
++	if (new == NULL)
++		return 0;
++
++	rule->flags |= BUS_MATCH_SENDER;
++	kfree(rule->sender);
++	rule->sender = new;
++
++	return 1;
++}
++
++static int
++bus_match_rule_set_destination(struct bus_match_rule *rule,
++			       const char   *destination,
++			       gfp_t gfp_flags)
++{
++	char *new;
++
++	WARN_ON(!destination);
++
++	new = kstrdup(destination, gfp_flags);
++	if (new == NULL)
++		return 0;
++
++	rule->flags |= BUS_MATCH_DESTINATION;
++	kfree(rule->destination);
++	rule->destination = new;
++
++	return 1;
++}
++
++static int
++bus_match_rule_set_path(struct bus_match_rule *rule,
++			const char *path,
++			gfp_t gfp_flags)
++{
++	char *new;
++
++	WARN_ON(!path);
++
++	new = kstrdup(path, gfp_flags);
++	if (new == NULL)
++		return 0;
++
++	rule->flags |= BUS_MATCH_PATH;
++	kfree(rule->path);
++	rule->path = new;
++
++	return 1;
++}
++
++#if 0
++static int bus_match_rule_set_arg(struct bus_match_rule *rule, int arg,
++			   const char *value, int is_path, gfp_t gfp_flags)
++{
++	int length;
++	char *new;
++
++	/* args_len is the number of args not including null termination
++	 * in the char**
++	 */
++	if (arg >= rule->args_len) {
++		unsigned int *new_arg_lens;
++		char **new_args;
++		int new_args_len;
++		int i;
++
++		new_args_len = arg + 1;
++
++		/* add another + 1 here for null termination */
++		new_args = krealloc(rule->args, sizeof(char *) *
++				    (new_args_len + 1), gfp_flags);
++
++		if (new_args == NULL)
++			return 0;
++
++		/* NULL the new slots */
++		i = rule->args_len;
++		while (i <= new_args_len) { /* <= for null termination */
++			new_args[i] = NULL;
++			++i;
++		}
++
++		rule->args = new_args;
++
++		/* and now add to the lengths */
++		new_arg_lens = krealloc(rule->arg_lens, sizeof(int) *
++					(new_args_len + 1), gfp_flags);
++
++		if (new_arg_lens == NULL)
++			return 0;
++
++		/* zero the new slots */
++		i = rule->args_len;
++		while (i <= new_args_len) { /* <= for null termination */
++			new_arg_lens[i] = 0;
++			++i;
++		}
++
++		rule->arg_lens = new_arg_lens;
++		rule->args_len = new_args_len;
++	}
++
++	length = strlen(value);
++	new = kstrdup(value, gfp_flags);
++	if (!new)
++		return 0;
++
++	rule->flags |= BUS_MATCH_ARGS;
++
++	kfree(rule->args[arg]);
++	rule->arg_lens[arg] = length;
++	rule->args[arg] = new;
++
++	if (is_path)
++		rule->arg_lens[arg] |= BUS_MATCH_ARG_IS_PATH;
++
++	return 1;
++}
++#endif
++
++#define ISWHITE(c) (((c) == ' ') || ((c) == '\t') || ((c) == '\n') || ((c) == '\r'))
++
++static int find_key(const char *str, int start, char *key, int *value_pos)
++{
++	const char *p;
++	const char *s;
++	const char *key_start;
++	const char *key_end;
++
++	s = str;
++
++	p = s + start;
++
++	while (*p && ISWHITE(*p))
++		++p;
++
++	key_start = p;
++
++	while (*p && *p != '=' && !ISWHITE(*p))
++		++p;
++
++	key_end = p;
++
++	while (*p && ISWHITE(*p))
++		++p;
++
++	if (key_start == key_end) {
++		/* Empty match rules or trailing whitespace are OK */
++		*value_pos = p - s;
++		return 1;
++	}
++
++	if (*p != '=') {
++		pr_warning("Match rule has a key with no subsequent '=' character");
++		return 0;
++	}
++	++p;
++
++	strncat(key, key_start, key_end - key_start);
++
++	*value_pos = p - s;
++
++	return 1;
++}
++
++static int find_value(const char *str, int start, const char *key, char *value,
++		      int *value_end)
++{
++	const char *p;
++	const char *s;
++	char quote_char;
++	int orig_len;
++
++	orig_len = strlen(value);
++
++	s = str;
++
++	p = s + start;
++
++	quote_char = '\0';
++
++	while (*p) {
++		if (quote_char == '\0') {
++			switch (*p) {
++			case '\0':
++				goto done;
++
++			case '\'':
++				quote_char = '\'';
++				goto next;
++
++			case ',':
++				++p;
++				goto done;
++
++			case '\\':
++				quote_char = '\\';
++				goto next;
++
++			default:
++				strncat(value, p, 1);
++			}
++		} else if (quote_char == '\\') {
++			/*\ only counts as an escape if escaping a quote mark */
++			if (*p != '\'')
++				strncat(value, "\\", 1);
++
++			strncat(value, p, 1);
++
++			quote_char = '\0';
++		} else {
++			if (*p == '\'')
++				quote_char = '\0';
++			else
++				strncat(value, p, 1);
++		}
++
++next:
++		++p;
++	}
++
++done:
++
++	if (quote_char == '\\')
++		strncat(value, "\\", 1);
++	else if (quote_char == '\'') {
++		pr_warning("Unbalanced quotation marks in match rule");
++		return 0;
++	}
++
++	/* Zero-length values are allowed */
++
++	*value_end = p - s;
++
++	return 1;
++}
++
++/* duplicates aren't allowed so the real legitimate max is only 6 or
++ * so. Leaving extra so we don't have to bother to update it.
++ * FIXME this is sort of busted now with arg matching, but we let
++ * you match on up to 10 args for now
++ */
++#define MAX_RULE_TOKENS 16
++
++/* this is slightly too high level to be termed a "token"
++ * but let's not be pedantic.
++ */
++struct rule_token {
++	char *key;
++	char *value;
++};
++
++static int tokenize_rule(const char *rule_text,
++			 struct rule_token tokens[MAX_RULE_TOKENS],
++			 gfp_t gfp_flags)
++{
++	int i;
++	int pos;
++	int retval;
++
++	retval = 0;
++
++	i = 0;
++	pos = 0;
++	while (i < MAX_RULE_TOKENS &&
++	       pos < strlen(rule_text)) {
++		char *key;
++		char *value;
++
++		key = kzalloc(DBUS_STRING_MAX_LENGTH, gfp_flags);
++		if (!key) {
++			pr_err("Out of memory");
++			BUG();
++			return 0;
++		}
++
++		value = kzalloc(DBUS_STRING_MAX_LENGTH, gfp_flags);
++		if (!value) {
++			kfree(key);
++			pr_err("Out of memory");
++			BUG();
++			return 0;
++		}
++
++		if (!find_key(rule_text, pos, key, &pos))
++			goto out;
++
++		if (strlen(key) == 0)
++			goto next;
++
++		tokens[i].key = key;
++
++		if (!find_value(rule_text, pos, tokens[i].key, value, &pos))
++			goto out;
++
++		tokens[i].value = value;
++
++next:
++		++i;
++	}
++
++	retval = 1;
++
++out:
++	if (!retval) {
++		i = 0;
++		while (tokens[i].key || tokens[i].value) {
++			kfree(tokens[i].key);
++			kfree(tokens[i].value);
++			tokens[i].key = NULL;
++			tokens[i].value = NULL;
++			++i;
++		}
++	}
++
++	return retval;
++}
++
++/*
++ * The format is comma-separated with strings quoted with single quotes
++ * as for the shell (to escape a literal single quote, use '\'').
++ *
++ * type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',
++ * member='Foo', path='/bar/foo',destination=':452345.34'
++ *
++ */
++struct bus_match_rule *bus_match_rule_parse(const char *rule_text, gfp_t gfp_flags)
++{
++	struct bus_match_rule *rule;
++	struct rule_token tokens[MAX_RULE_TOKENS+1]; /* NULL termination + 1 */
++	int i;
++
++	if (strlen(rule_text) > DBUS_MAXIMUM_MATCH_RULE_LENGTH) {
++		pr_warning("Match rule text is %d bytes, maximum is %d",
++			    strlen(rule_text),
++			    DBUS_MAXIMUM_MATCH_RULE_LENGTH);
++		return NULL;
++	}
++
++	memset(tokens, '\0', sizeof(tokens));
++
++	rule = bus_match_rule_new(gfp_flags);
++	if (rule == NULL) {
++		pr_err("Out of memory");
++		BUG();
++		goto failed;
++	}
++
++        rule->rule_text = kstrdup(rule_text, gfp_flags);
++	if (rule->rule_text == NULL) {
++		pr_err("Out of memory");
++		BUG();
++		goto failed;
++	}
++
++	if (!tokenize_rule(rule_text, tokens, gfp_flags))
++		goto failed;
++
++	i = 0;
++	while (tokens[i].key != NULL) {
++		const char *key = tokens[i].key;
++		const char *value = tokens[i].value;
++
++		if (strcmp(key, "type") == 0) {
++			int t;
++
++			if (rule->flags & BUS_MATCH_MESSAGE_TYPE) {
++				pr_warning("Key %s specified twice in match rule\n", key);
++				goto failed;
++			}
++
++			t = dbus_message_type_from_string(value);
++
++			if (t == DBUS_MESSAGE_TYPE_INVALID) {
++				pr_warning("Invalid message type (%s) in match rule\n", value);
++				goto failed;
++			}
++
++			if (!bus_match_rule_set_message_type(rule, t, gfp_flags)) {
++				pr_err("Out of memeory");
++				BUG();
++				goto failed;
++			}
++		} else if (strcmp(key, "sender") == 0) {
++			if (rule->flags & BUS_MATCH_SENDER) {
++				pr_warning("Key %s specified twice in match rule\n", key);
++				goto failed;
++			}
++
++			if (!bus_match_rule_set_sender(rule, value, gfp_flags)) {
++				pr_err("Out of memeory");
++				BUG();
++				goto failed;
++			}
++		} else if (strcmp(key, "interface") == 0) {
++			if (rule->flags & BUS_MATCH_INTERFACE) {
++				pr_warning("Key %s specified twice in match rule\n", key);
++				goto failed;
++			}
++
++			if (!bus_match_rule_set_interface(rule, value, gfp_flags)) {
++				pr_err("Out of memeory");
++				BUG();
++				goto failed;
++			}
++		} else if (strcmp(key, "member") == 0) {
++			if (rule->flags & BUS_MATCH_MEMBER) {
++				pr_warning("Key %s specified twice in match rule\n", key);
++				goto failed;
++			}
++
++			if (!bus_match_rule_set_member(rule, value, gfp_flags)) {
++				pr_err("Out of memeory");
++				BUG();
++				goto failed;
++			}
++		} else if (strcmp(key, "path") == 0) {
++			if (rule->flags & BUS_MATCH_PATH) {
++				pr_warning("Key %s specified twice in match rule\n", key);
++				goto failed;
++			}
++
++			if (!bus_match_rule_set_path(rule, value, gfp_flags)) {
++				pr_err("Out of memeory");
++				BUG();
++				goto failed;
++			}
++		} else if (strcmp(key, "destination") == 0) {
++			if (rule->flags & BUS_MATCH_DESTINATION) {
++				pr_warning("Key %s specified twice in match rule\n", key);
++				goto failed;
++			}
++
++			if (!bus_match_rule_set_destination(rule, value, gfp_flags)) {
++				pr_err("Out of memeory");
++				BUG();
++				goto failed;
++			}
++		} else if (strcmp(key, "eavesdrop") == 0) {
++			if (strcmp(value, "true") == 0) {
++				rule->flags |= BUS_MATCH_CLIENT_IS_EAVESDROPPING;
++			} else if (strcmp(value, "false") == 0) {
++				rule->flags &= ~(BUS_MATCH_CLIENT_IS_EAVESDROPPING);
++			} else {
++				pr_warning("eavesdrop='%s' is invalid, "
++				           "it should be 'true' or 'false'\n", value);
++				goto failed;
++			}
++		} else if (strncmp(key, "arg", 3) != 0) {
++			pr_warning("Unknown key \"%s\" in match rule\n",
++				   key);
++			goto failed;
++		}
++
++		++i;
++	}
++
++	goto out;
++
++failed:
++	if (rule) {
++		bus_match_rule_free(rule);
++		rule = NULL;
++	}
++
++out:
++
++	i = 0;
++	while (tokens[i].key || tokens[i].value) {
++		WARN_ON(i >= MAX_RULE_TOKENS);
++		kfree(tokens[i].key);
++		kfree(tokens[i].value);
++		++i;
++	}
++
++	return rule;
++}
++
++/* return the match rule containing the hlist_head. It may not be the first
++ * match rule in the list. */
++struct bus_match_rule *match_rule_search(struct rb_root *root,
++					 const char *interface)
++{
++	struct rb_node *node = root->rb_node;
++
++	while (node) {
++		struct bus_match_rule *data =
++			container_of(node, struct bus_match_rule, node);
++		int result;
++
++		result = strcmp(interface, data->interface);
++
++		if (result < 0)
++			node = node->rb_left;
++		else if (result > 0)
++			node = node->rb_right;
++		else
++			return data;
++	}
++	return NULL;
++}
++
++void match_rule_insert(struct rb_root *root, struct bus_match_rule *data)
++{
++	struct rb_node **new = &(root->rb_node), *parent = NULL;
++
++	/* Figure out where to put new node */
++	while (*new) {
++		struct bus_match_rule *this =
++			container_of(*new, struct bus_match_rule, node);
++		int result = strcmp(data->interface, this->interface);
++
++		parent = *new;
++		if (result < 0)
++			new = &((*new)->rb_left);
++		else if (result > 0)
++			new = &((*new)->rb_right);
++		else {
++			/* the head is not used */
++			INIT_HLIST_HEAD(&data->first);
++			/* Add it at the beginning of the list */
++			hlist_add_head(&data->list, &this->first);
++			return;
++		}
++	}
++
++	/* this rule is single in its list */
++	INIT_HLIST_HEAD(&data->first);
++	hlist_add_head(&data->list, &data->first);
++
++	/* Add new node and rebalance tree. */
++	rb_link_node(&data->node, parent, new);
++	rb_insert_color(&data->node, root);
++}
++
++struct bus_match_maker *bus_matchmaker_new(gfp_t gfp_flags)
++{
++	struct bus_match_maker *matchmaker;
++	int i;
++
++	matchmaker = kzalloc(sizeof(struct bus_match_maker), gfp_flags);
++	if (matchmaker == NULL)
++		return NULL;
++
++	for (i = DBUS_MESSAGE_TYPE_INVALID; i < DBUS_NUM_MESSAGE_TYPES; i++) {
++		struct rule_pool *p = matchmaker->rules_by_type + i;
++
++		p->rules_by_iface = RB_ROOT;
++	}
++
++	kref_init(&matchmaker->kref);
++
++	return matchmaker;
++}
++
++void bus_matchmaker_free(struct kref *kref)
++{
++	struct bus_match_maker *matchmaker;
++	struct list_head del_list;
++	struct rb_node *n;
++	int i;
++
++	matchmaker = container_of(kref, struct bus_match_maker, kref);
++
++	/* free names */
++	INIT_LIST_HEAD(&del_list);
++	n = matchmaker->names.rb_node;
++	if (n) {
++		struct dbus_name *dbus_name, *cur, *tmp;
++
++		dbus_name = rb_entry(n, struct dbus_name, node);
++		list_add_tail(&dbus_name->del_list, &del_list);
++
++		list_for_each_entry(cur, &del_list, del_list) {
++			struct dbus_name *right, *left;
++			if (cur->node.rb_right) {
++				right = rb_entry(cur->node.rb_right, struct dbus_name, node);
++				list_add_tail(&right->del_list, &del_list);
++			}
++			if (cur->node.rb_left) {
++				left = rb_entry(cur->node.rb_left, struct dbus_name, node);
++				list_add_tail(&left->del_list, &del_list);
++			}
++		}
++		list_for_each_entry_safe(dbus_name, tmp, &del_list, del_list) {
++			kfree(dbus_name->name);
++			list_del(&dbus_name->del_list);
++			kfree(dbus_name);
++		}
++	}
++	WARN_ON(!list_empty_careful(&del_list));
++
++	/* free match rules */
++	for (i = 0 ; i < DBUS_NUM_MESSAGE_TYPES ; i++) {
++		struct rule_pool *pool = matchmaker->rules_by_type + i;
++		struct bus_match_rule *match_rule, *cur, *tmp;
++		struct hlist_node *list_tmp, *list_tmp2;
++
++		/* free match rules from the list */
++		hlist_for_each_entry_safe(cur, list_tmp, list_tmp2, &pool->rules_without_iface, list) {
++			bus_match_rule_free(cur);
++		}
++
++		/* free match rules from the tree */
++		if (!pool->rules_by_iface.rb_node)
++			continue;
++		match_rule = rb_entry(pool->rules_by_iface.rb_node,
++		                      struct bus_match_rule, node);
++		list_add_tail(&match_rule->del_list, &del_list);
++
++		list_for_each_entry(cur, &del_list, del_list) {
++			struct bus_match_rule *right, *left;
++			if (cur->node.rb_right) {
++				right = rb_entry(cur->node.rb_right, struct bus_match_rule, node);
++				list_add_tail(&right->del_list, &del_list);
++			}
++			if (cur->node.rb_left) {
++				left = rb_entry(cur->node.rb_left, struct bus_match_rule, node);
++				list_add_tail(&left->del_list, &del_list);
++			}
++		}
++		list_for_each_entry_safe(match_rule, tmp, &del_list, del_list) {
++			/* keep a ref during the loop to ensure the first
++			 * iteration of the loop does not delete it */
++			hlist_for_each_entry_safe(cur, list_tmp, list_tmp2, &match_rule->first, list) {
++				if (cur != match_rule)
++					bus_match_rule_free(cur);
++			}
++			list_del(&match_rule->del_list);
++			bus_match_rule_free(match_rule);
++		}
++		WARN_ON(!list_empty_careful(&del_list));
++	}
++
++	kfree(matchmaker);
++}
++
++/* The rule can't be modified after it's added. */
++int bus_matchmaker_add_rule(struct bus_match_maker *matchmaker,
++			    struct bus_match_rule *rule)
++{
++	struct rule_pool *pool;
++
++	WARN_ON(rule->message_type < 0);
++	WARN_ON(rule->message_type >= DBUS_NUM_MESSAGE_TYPES);
++
++	pool = matchmaker->rules_by_type + rule->message_type;
++
++	if (rule->interface) {
++		match_rule_insert(&pool->rules_by_iface, rule);
++        } else {
++		hlist_add_head(&rule->list, &pool->rules_without_iface);
++        }
++
++	return 1;
++}
++
++static int match_rule_equal(struct bus_match_rule *a,
++			    struct bus_match_rule *b)
++{
++	if (a->flags != b->flags)
++		return 0;
++
++	if ((a->flags & BUS_MATCH_MESSAGE_TYPE) &&
++	    a->message_type != b->message_type)
++		return 0;
++
++	if ((a->flags & BUS_MATCH_MEMBER) &&
++	    strcmp(a->member, b->member) != 0)
++		return 0;
++
++	if ((a->flags & BUS_MATCH_PATH) &&
++	    strcmp(a->path, b->path) != 0)
++		return 0;
++
++	if ((a->flags & BUS_MATCH_INTERFACE) &&
++	    strcmp(a->interface, b->interface) != 0)
++		return 0;
++
++	if ((a->flags & BUS_MATCH_SENDER) &&
++	    strcmp(a->sender, b->sender) != 0)
++		return 0;
++
++	if ((a->flags & BUS_MATCH_DESTINATION) &&
++	    strcmp(a->destination, b->destination) != 0)
++		return 0;
++
++	if (a->flags & BUS_MATCH_ARGS) {
++		int i;
++
++		if (a->args_len != b->args_len)
++			return 0;
++
++		i = 0;
++		while (i < a->args_len) {
++			int length;
++
++			if ((a->args[i] != NULL) != (b->args[i] != NULL))
++				return 0;
++
++			if (a->arg_lens[i] != b->arg_lens[i])
++				return 0;
++
++			length = a->arg_lens[i] & ~BUS_MATCH_ARG_IS_PATH;
++
++			if (a->args[i] != NULL) {
++				WARN_ON(!b->args[i]);
++				if (memcmp(a->args[i], b->args[i], length) != 0)
++					return 0;
++			}
++
++			++i;
++		}
++	}
++
++	return 1;
++}
++
++/* Remove a single rule which is equal to the given rule by value */
++void bus_matchmaker_remove_rule_by_value(struct bus_match_maker *matchmaker,
++					 struct bus_match_rule *rule)
++{
++	struct rule_pool *pool;
++
++	WARN_ON(rule->message_type < 0);
++	WARN_ON(rule->message_type >= DBUS_NUM_MESSAGE_TYPES);
++
++	pool = matchmaker->rules_by_type + rule->message_type;
++
++	if (rule->interface) {
++		struct bus_match_rule *head =
++			match_rule_search(&pool->rules_by_iface,
++					  rule->interface);
++
++		struct hlist_node *cur;
++		struct bus_match_rule *cur_rule;
++		hlist_for_each_entry(cur_rule, cur, &head->first, list) {
++			if (match_rule_equal(cur_rule, rule)) {
++				hlist_del(cur);
++				if (hlist_empty(&head->first))
++					rb_erase(&head->node, &pool->rules_by_iface);
++				bus_match_rule_free(cur_rule);
++				break;
++			}
++		}
++	} else {
++		struct hlist_head *head = &pool->rules_without_iface;
++
++		struct hlist_node *cur;
++		struct bus_match_rule *cur_rule;
++		hlist_for_each_entry(cur_rule, cur, head, list) {
++			if (match_rule_equal(cur_rule, rule)) {
++				hlist_del(cur);
++				bus_match_rule_free(cur_rule);
++				break;
++			}
++		}
++	}
++
++}
++
++static int connection_is_primary_owner(struct bus_match_maker *connection,
++				       const char *service_name)
++{
++        struct rb_node *node = connection->names.rb_node;
++
++	if (!service_name)
++		return 0;
++
++        while (node) {
++                struct dbus_name *data = container_of(node, struct dbus_name, node);
++                int result;
++
++                result = strcmp(service_name, data->name);
++
++                if (result < 0)
++                        node = node->rb_left;
++                else if (result > 0)
++                        node = node->rb_right;
++                else
++                        return 1;
++        }
++	return 0;
++}
++
++static int match_rule_matches(struct bus_match_maker *matchmaker,
++			      struct bus_match_maker *sender,
++			      int eavesdrop,
++			      struct bus_match_rule *rule,
++			      const struct dbus_message *message)
++{
++	/* Don't consider the rule if this is a eavesdropping match rule
++	 * and eavesdropping is not allowed on that peer */
++	if ((rule->flags & BUS_MATCH_CLIENT_IS_EAVESDROPPING) && !eavesdrop)
++		return 0;
++
++	/* Since D-Bus 1.5.6, match rules do not match messages which have a
++	 * DESTINATION field unless the match rule specifically requests this
++	 * by specifying eavesdrop='true' in the match rule. */
++	if (message->destination &&
++	    !(rule->flags & BUS_MATCH_CLIENT_IS_EAVESDROPPING))
++		return 0;
++
++	if (rule->flags & BUS_MATCH_MEMBER) {
++		const char *member;
++
++		WARN_ON(!rule->member);
++
++		member = message->member;
++		if (member == NULL)
++			return 0;
++
++		if (strcmp(member, rule->member) != 0)
++			return 0;
++	}
++
++	if (rule->flags & BUS_MATCH_SENDER) {
++		WARN_ON(!rule->sender);
++
++		if (sender == NULL) {
++			if (strcmp(rule->sender,
++				   "org.freedesktop.DBus") != 0)
++				return 0;
++		} else
++			if (!connection_is_primary_owner(sender, rule->sender))
++				return 0;
++	}
++
++	if (rule->flags & BUS_MATCH_DESTINATION) {
++		const char *destination;
++
++		WARN_ON(!rule->destination);
++
++		destination = message->destination;
++		if (destination == NULL)
++			return 0;
++
++		/* This will not just work out of the box because it this is
++		 * an eavesdropping match rule. */
++		if (matchmaker == NULL) {
++			if (strcmp(rule->destination,
++				   "org.freedesktop.DBus") != 0)
++				return 0;
++		} else
++			if (!connection_is_primary_owner(matchmaker,
++							 rule->destination))
++				return 0;
++	}
++
++	if (rule->flags & BUS_MATCH_PATH) {
++		const char *path;
++
++		WARN_ON(!rule->path);
++
++		path = message->path;
++		if (path == NULL)
++			return 0;
++
++		if (strcmp(path, rule->path) != 0)
++			return 0;
++	}
++
++	return 1;
++}
++
++static bool get_recipients_from_list(struct bus_match_maker *matchmaker,
++				     struct bus_match_maker *sender,
++				     int eavesdrop,
++				     struct hlist_head *rules,
++				     const struct dbus_message *message)
++{
++	struct hlist_node *cur;
++	struct bus_match_rule *rule;
++
++	if (rules == NULL) {
++                pr_debug("no rules of this type\n");
++		return 0;
++        }
++
++	hlist_for_each_entry(rule, cur, rules, list) {
++		if (match_rule_matches(matchmaker, sender, eavesdrop, rule,
++					message)) {
++			pr_debug("[YES] deliver with match rule \"%s\"\n", rule->rule_text);
++                        return 1;
++		} else {
++			pr_debug("[NO]  deliver with match rule \"%s\"\n", rule->rule_text);
++		}
++	}
++	pr_debug("[NO]  no match rules\n");
++	return 0;
++}
++
++static struct hlist_head
++*bus_matchmaker_get_rules(struct bus_match_maker *matchmaker,
++			  int message_type, const char *interface)
++{
++	static struct hlist_head empty = {0,};
++	struct rule_pool *p;
++
++	WARN_ON(message_type < 0);
++	WARN_ON(message_type >= DBUS_NUM_MESSAGE_TYPES);
++
++	p = matchmaker->rules_by_type + message_type;
++
++	if (interface == NULL)
++		return &p->rules_without_iface;
++	else {
++		struct bus_match_rule *rule =
++			match_rule_search(&p->rules_by_iface, interface);
++		if (rule)
++			return &rule->first;
++		else
++			return &empty;
++	}
++}
++
++bool bus_matchmaker_filter(struct bus_match_maker *matchmaker,
++			   struct bus_match_maker *sender,
++			   int eavesdrop,
++			   const struct dbus_message *message)
++{
++	int type;
++	const char *interface;
++	struct hlist_head *neither, *just_type, *just_iface, *both;
++
++	type = message->type;
++	interface = message->interface;
++
++	neither = bus_matchmaker_get_rules(matchmaker,
++					   DBUS_MESSAGE_TYPE_INVALID, NULL);
++	just_type = just_iface = both = NULL;
++
++	if (interface != NULL)
++		just_iface = bus_matchmaker_get_rules(matchmaker,
++						      DBUS_MESSAGE_TYPE_INVALID,
++						      interface);
++
++	if (type > DBUS_MESSAGE_TYPE_INVALID && type < DBUS_NUM_MESSAGE_TYPES) {
++		just_type = bus_matchmaker_get_rules(matchmaker, type, NULL);
++
++		if (interface != NULL)
++			both = bus_matchmaker_get_rules(matchmaker, type,
++							interface);
++	}
++
++	if (get_recipients_from_list(matchmaker, sender, eavesdrop, neither, message))
++		return 1;
++	if (get_recipients_from_list(matchmaker, sender, eavesdrop, just_iface, message))
++		return 1;
++	if (get_recipients_from_list(matchmaker, sender, eavesdrop, just_type, message))
++		return 1;
++	if (get_recipients_from_list(matchmaker, sender, eavesdrop, both, message))
++		return 1;
++
++	return connection_is_primary_owner(matchmaker, message->destination);
++}
++
++void bus_matchmaker_add_name(struct bus_match_maker *matchmaker,
++			     const char *name,
++			     gfp_t gfp_flags)
++{
++	struct dbus_name *dbus_name;
++	struct rb_node **new = &(matchmaker->names.rb_node), *parent = NULL;
++
++	dbus_name = kmalloc(sizeof(struct dbus_name), gfp_flags);
++	if (!dbus_name)
++		return;
++	dbus_name->name = kstrdup(name, gfp_flags);
++	if (!dbus_name->name)
++		return;
++
++	/* Figure out where to put new node */
++	while (*new) {
++		struct dbus_name *this = container_of(*new, struct dbus_name, node);
++		int result = strcmp(dbus_name->name, this->name);
++
++		parent = *new;
++		if (result < 0)
++			new = &((*new)->rb_left);
++		else if (result > 0)
++			new = &((*new)->rb_right);
++		else
++			return;
++	}
++
++	/* Add new node and rebalance tree. */
++	rb_link_node(&dbus_name->node, parent, new);
++	rb_insert_color(&dbus_name->node, &matchmaker->names);
++}
++
++void bus_matchmaker_remove_name(struct bus_match_maker *matchmaker,
++				const char *name)
++{
++	struct rb_node *node = matchmaker->names.rb_node;
++
++	while (node) {
++		struct dbus_name *data = container_of(node, struct dbus_name, node);
++		int result;
++
++		result = strcmp(name, data->name);
++
++		if (result < 0)
++			node = node->rb_left;
++		else if (result > 0)
++			node = node->rb_right;
++		else {
++			rb_erase(&data->node, &matchmaker->names);
++			kfree(data->name);
++			kfree(data);
++		}
++	}
++
++}
++
+diff --git a/net/netfilter/nfdbus/matchrule.h b/net/netfilter/nfdbus/matchrule.h
+new file mode 100644
+index 0000000..8eacfb5
+--- /dev/null
++++ b/net/netfilter/nfdbus/matchrule.h
+@@ -0,0 +1,86 @@
++/*
++ * signals.h  Bus signal connection implementation
++ *
++ * Copyright (C) 2003  Red Hat, Inc.
++ *
++ * Licensed under the Academic Free License version 2.1
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ */
++
++#ifndef BUS_SIGNALS_H
++#define BUS_SIGNALS_H
++
++#include <linux/gfp.h>
++#include <linux/list.h>
++#include <linux/rbtree.h>
++#include <linux/slab.h>
++#include <net/af_bus.h>
++
++#include "message.h"
++#include "dbus-protocol.h"
++
++
++struct bus_match_rule *bus_match_rule_new(gfp_t gfp_flags);
++void bus_match_rule_free(struct bus_match_rule *rule);
++
++struct bus_match_rule *bus_match_rule_parse(const char *rule_text,
++					    gfp_t gfp_flags);
++
++struct rule_pool {
++	/* Maps non-NULL interface names to a list of bus_match_rule */
++	struct rb_root rules_by_iface;
++
++	/* List of bus_match_rule which don't specify an interface */
++	struct hlist_head rules_without_iface;
++};
++
++struct bus_match_maker {
++	struct sockaddr_bus addr;
++
++	struct hlist_node table_node;
++
++	/* Pools of rules, grouped by the type of message they match. 0
++	 * (DBUS_MESSAGE_TYPE_INVALID) represents rules that do not specify a
++	 * message type.
++	 */
++	struct rule_pool rules_by_type[DBUS_NUM_MESSAGE_TYPES];
++
++	struct rb_root names;
++
++	struct kref kref;
++};
++
++
++struct bus_match_maker *bus_matchmaker_new(gfp_t gfp_flags);
++void bus_matchmaker_free(struct kref *kref);
++
++int bus_matchmaker_add_rule(struct bus_match_maker *matchmaker,
++			    struct bus_match_rule *rule);
++void bus_matchmaker_remove_rule_by_value(struct bus_match_maker *matchmaker,
++					 struct bus_match_rule *value);
++
++bool bus_matchmaker_filter(struct bus_match_maker *matchmaker,
++			   struct bus_match_maker *sender,
++			   int eavesdrop,
++			   const struct dbus_message *message);
++
++void bus_matchmaker_add_name(struct bus_match_maker *matchmaker,
++			     const char *name, gfp_t gfp_flags);
++void bus_matchmaker_remove_name(struct bus_match_maker *matchmaker,
++				const char *name);
++
++#endif /* BUS_SIGNALS_H */
+diff --git a/net/netfilter/nfdbus/message.c b/net/netfilter/nfdbus/message.c
+new file mode 100644
+index 0000000..58368a5
+--- /dev/null
++++ b/net/netfilter/nfdbus/message.c
+@@ -0,0 +1,290 @@
++/*
++ * message.c  Basic D-Bus message parsing
++ *
++ * Copyright (C) 2010  Collabora Ltd
++ * Authors:	Alban Crequy <alban.crequy@collabora.co.uk>
++ * Copyright (C) 2002, 2003, 2004, 2005  Red Hat Inc.
++ * Copyright (C) 2002, 2003  CodeFactory AB
++ *
++ * Licensed under the Academic Free License version 2.1
++ *
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ */
++
++#include <linux/slab.h>
++
++#include "message.h"
++#include "dbus-protocol.h"
++
++/**
++ * Utility function to convert a machine-readable (not translated)
++ * string into a D-Bus message type.
++ *
++ * @code
++ *   "method_call"    -> DBUS_MESSAGE_TYPE_METHOD_CALL
++ *   "method_return"  -> DBUS_MESSAGE_TYPE_METHOD_RETURN
++ *   "signal"         -> DBUS_MESSAGE_TYPE_SIGNAL
++ *   "error"          -> DBUS_MESSAGE_TYPE_ERROR
++ *   anything else    -> DBUS_MESSAGE_TYPE_INVALID
++ * @endcode
++ *
++ */
++int dbus_message_type_from_string(const char *type_str)
++{
++	if (strcmp(type_str, "method_call") == 0)
++		return DBUS_MESSAGE_TYPE_METHOD_CALL;
++	if (strcmp(type_str, "method_return") == 0)
++		return DBUS_MESSAGE_TYPE_METHOD_RETURN;
++	else if (strcmp(type_str, "signal") == 0)
++		return DBUS_MESSAGE_TYPE_SIGNAL;
++	else if (strcmp(type_str, "error") == 0)
++		return DBUS_MESSAGE_TYPE_ERROR;
++	else
++		return DBUS_MESSAGE_TYPE_INVALID;
++}
++
++/**
++ * Utility function to convert a D-Bus message type into a
++ * machine-readable string (not translated).
++ *
++ * @code
++ *   DBUS_MESSAGE_TYPE_METHOD_CALL    -> "method_call"
++ *   DBUS_MESSAGE_TYPE_METHOD_RETURN  -> "method_return"
++ *   DBUS_MESSAGE_TYPE_SIGNAL         -> "signal"
++ *   DBUS_MESSAGE_TYPE_ERROR          -> "error"
++ *   DBUS_MESSAGE_TYPE_INVALID        -> "invalid"
++ * @endcode
++ *
++ */
++const char *dbus_message_type_to_string(int type)
++{
++	switch (type) {
++	case DBUS_MESSAGE_TYPE_METHOD_CALL:
++		return "method_call";
++	case DBUS_MESSAGE_TYPE_METHOD_RETURN:
++		return "method_return";
++	case DBUS_MESSAGE_TYPE_SIGNAL:
++		return "signal";
++	case DBUS_MESSAGE_TYPE_ERROR:
++		return "error";
++	default:
++		return "invalid";
++	}
++}
++
++int dbus_message_parse(unsigned char *message, size_t len,
++		       struct dbus_message *dbus_message)
++{
++	unsigned char *cur;
++	int array_header_len;
++
++	dbus_message->message = message;
++
++	if (len < 4 + 4 + 4 + 4 || message[1] == 0 || message[1] > 4)
++		return -EINVAL;
++
++	dbus_message->type = message[1];
++	dbus_message->body_length = *((u32 *)(message + 4));
++	cur = message + 12;
++	array_header_len = *(u32 *)cur;
++	dbus_message->len_offset = 12;
++	cur += 4;
++	while (cur < message + len
++	       && cur < message + 12 + 4 + array_header_len) {
++		int header_code;
++		int signature_len;
++		unsigned char *signature;
++		int str_len;
++		unsigned char *str;
++
++		/* D-Bus alignment craziness */
++		if ((cur - message) % 8 != 0)
++			cur += 8 - (cur - message) % 8;
++
++		header_code = *(char *)cur;
++		cur++;
++		signature_len = *(char *)cur;
++		/* All header fields of the current D-Bus spec have a simple
++		 * type, either o, s, g, or u */
++		if (signature_len != 1)
++			return -EINVAL;
++		cur++;
++		signature = cur;
++		cur += signature_len + 1;
++		if (signature[0] != 'o' &&
++		    signature[0] != 's' &&
++		    signature[0] != 'g' &&
++		    signature[0] != 'u')
++			return -EINVAL;
++
++		if (signature[0] == 'u') {
++			cur += 4;
++			continue;
++		}
++
++		if (signature[0] != 'g') {
++			str_len = *(u32 *)cur;
++			cur += 4;
++		} else {
++			str_len = *(char *)cur;
++			cur += 1;
++		}
++
++		str = cur;
++		switch (header_code) {
++		case 1:
++			dbus_message->path = str;
++			break;
++		case 2:
++			dbus_message->interface = str;
++			break;
++		case 3:
++			dbus_message->member = str;
++			break;
++		case 6:
++			dbus_message->destination = str;
++			break;
++		case 7:
++			dbus_message->sender = str;
++			break;
++		case 8:
++			dbus_message->body_signature = str;
++			break;
++		}
++		cur += str_len + 1;
++	}
++
++	dbus_message->padding_end = (8 - (cur - message) % 8) % 8;
++
++	/* Jump to body D-Bus alignment craziness */
++	if ((cur - message) % 8 != 0)
++		cur += 8 - (cur - message) % 8;
++	dbus_message->new_header_offset = cur - message;
++
++	if (dbus_message->new_header_offset
++	    + dbus_message->body_length != len) {
++		pr_warning("Message truncated? "
++			   "Header %d + Body %d != Length %zd\n",
++			   dbus_message->new_header_offset,
++			   dbus_message->body_length, len);
++		return -EINVAL;
++	}
++
++	if (dbus_message->body_signature &&
++	    dbus_message->body_signature[0] == 's') {
++		int str_len;
++		str_len = *(u32 *)cur;
++		cur += 4;
++		dbus_message->arg0 = cur;
++		cur += str_len + 1;
++	}
++
++	if ((cur - message) % 4 != 0)
++		cur += 4 - (cur - message) % 4;
++
++	if (dbus_message->body_signature &&
++	    dbus_message->body_signature[0] == 's' &&
++	    dbus_message->body_signature[1] == 's') {
++		int str_len;
++		str_len = *(u32 *)cur;
++		cur += 4;
++		dbus_message->arg1 = cur;
++		cur += str_len + 1;
++	}
++
++	if ((cur - message) % 4 != 0)
++		cur += 4 - (cur - message) % 4;
++
++	if (dbus_message->body_signature &&
++	    dbus_message->body_signature[0] == 's' &&
++	    dbus_message->body_signature[1] == 's' &&
++	    dbus_message->body_signature[2] == 's') {
++		int str_len;
++		str_len = *(u32 *)cur;
++		cur += 4;
++		dbus_message->arg2 = cur;
++		cur += str_len + 1;
++	}
++
++	if ((cur - message) % 4 != 0)
++		cur += 4 - (cur - message) % 4;
++
++	if (dbus_message->type == DBUS_MESSAGE_TYPE_SIGNAL &&
++            dbus_message->sender && dbus_message->path &&
++            dbus_message->interface && dbus_message->member &&
++            dbus_message->arg0 &&
++	    strcmp(dbus_message->sender, "org.freedesktop.DBus") == 0 &&
++	    strcmp(dbus_message->interface, "org.freedesktop.DBus") == 0 &&
++	    strcmp(dbus_message->path, "/org/freedesktop/DBus") == 0) {
++		if (strcmp(dbus_message->member, "NameAcquired") == 0)
++			dbus_message->name_acquired = dbus_message->arg0;
++		else if (strcmp(dbus_message->member, "NameLost") == 0)
++			dbus_message->name_lost = dbus_message->arg0;
++	}
++
++	return 0;
++}
++
++
++int dbus_message_add_sender(struct dbus_message *dbus_message,
++			    const char *sender, gfp_t gfp_flags)
++{
++	unsigned char *message = dbus_message->message;
++	unsigned char *new_message;
++	int added_size_not_aligned = 1 + 3 + 4 +
++		strlen(sender) + 1;
++	int added_size = added_size_not_aligned
++		+ (8 - added_size_not_aligned % 8) % 8;
++
++	dbus_message->new_len = dbus_message->len + added_size;
++	new_message = kmalloc(dbus_message->new_len, gfp_flags);
++	if (!new_message)
++		return -ENOMEM;
++
++	memcpy(new_message, message, dbus_message->new_header_offset);
++	*(char *)(new_message + dbus_message->new_header_offset)
++		= 7;
++	*(char *)(new_message + dbus_message->new_header_offset + 1)
++		= 1;
++	*(char *)(new_message + dbus_message->new_header_offset + 2)
++		= 's';
++	*(char *)(new_message + dbus_message->new_header_offset + 3)
++		= '\0';
++	*(u32 *)(new_message + dbus_message->new_header_offset + 4)
++		= strlen(sender);
++
++	BUG_ON(dbus_message->sender != NULL);
++	dbus_message->sender = new_message + dbus_message->new_header_offset
++		+ 1 + 3 + 4;
++	strcpy(dbus_message->sender, sender);
++	memset(new_message + dbus_message->new_header_offset
++	       + added_size_not_aligned, 0,
++	       added_size - added_size_not_aligned);
++	memcpy(new_message + dbus_message->new_header_offset
++	       + added_size,
++	       message + dbus_message->new_header_offset,
++	       dbus_message->len - dbus_message->new_header_offset);
++
++	*(u32 *)(new_message + dbus_message->len_offset) =
++		*(u32 *)(new_message + dbus_message->len_offset) +
++		dbus_message->padding_end + added_size_not_aligned;
++
++	kfree(message);
++	dbus_message_parse(new_message, dbus_message->new_len, dbus_message);
++
++	return 0;
++}
+diff --git a/net/netfilter/nfdbus/message.h b/net/netfilter/nfdbus/message.h
+new file mode 100644
+index 0000000..d3ab1a3
+--- /dev/null
++++ b/net/netfilter/nfdbus/message.h
+@@ -0,0 +1,65 @@
++/*
++ * message.h  Basic D-Bus message parsing
++ *
++ * Copyright (C) 2010  Collabora Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ */
++
++#ifndef DBUS_MESSAGE_H
++#define DBUS_MESSAGE_H
++
++#include <linux/list.h>
++
++/* No need to implement a feature-complete parser. It only implement what is
++ * needed by the bus. */
++struct dbus_message {
++	char *message;
++	size_t len;
++	size_t new_len;
++
++	/* direct pointers to the fields */
++	int type;
++	char *path;
++	char *interface;
++	char *member;
++	char *destination;
++	char *sender;
++	char *body_signature;
++	int body_length;
++	char *arg0;
++	char *arg1;
++	char *arg2;
++	char *name_acquired;
++	char *name_lost;
++
++	/* How to add the 'sender' field in the headers */
++	int new_header_offset;
++	int len_offset;
++	int padding_end;
++};
++
++int dbus_message_type_from_string(const char *type_str);
++
++const char *dbus_message_type_to_string(int type);
++
++int dbus_message_parse(unsigned char *message, size_t len,
++		       struct dbus_message *dbus_message);
++
++int dbus_message_add_sender(struct dbus_message *dbus_message,
++			    const char *sender, gfp_t gfp_flags);
++
++#endif /* DBUS_MESSAGE_H */
+diff --git a/net/netfilter/nfdbus/nfdbus.c b/net/netfilter/nfdbus/nfdbus.c
+new file mode 100644
+index 0000000..59fa638
+--- /dev/null
++++ b/net/netfilter/nfdbus/nfdbus.c
+@@ -0,0 +1,388 @@
++/*  
++ *  nfdbus.c - Netfilter module for AF_DBUS.
++ */
++
++#define DRIVER_AUTHOR "Alban Crequy"
++#define DRIVER_DESC   "Netfilter module for AF_DBUS"
++
++#include "nfdbus.h"
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/skbuff.h>
++#include <linux/netfilter.h>
++#include <linux/connector.h>
++#include <net/af_bus.h>
++
++#include "message.h"
++#include "matchrule.h"
++
++static struct nf_hook_ops nfho_dbus;
++
++static struct cb_id cn_cmd_id = { CN_IDX_NFDBUS, CN_VAL_NFDBUS };
++
++/* Scoped by AF_BUS address */
++struct hlist_head matchrules_table[BUS_HASH_SIZE];
++DEFINE_SPINLOCK(matchrules_lock);
++
++static struct bus_match_maker *find_match_maker(struct sockaddr_bus *addr,
++		bool create, bool delete)
++{
++	u64 hash;
++	struct hlist_node *node;
++	struct bus_match_maker *matchmaker;
++	int path_len = strlen(addr->sbus_path);
++
++	hash = csum_partial(addr->sbus_path,
++	                    strlen(addr->sbus_path), 0);
++	hash ^= addr->sbus_addr.s_addr;
++	hash ^= hash >> 32;
++	hash ^= hash >> 16;
++	hash ^= hash >> 8;
++	hash &= 0xff;
++
++	spin_lock(&matchrules_lock);
++	hlist_for_each_entry(matchmaker, node, &matchrules_table[hash],
++			     table_node) {
++		if (addr->sbus_family == matchmaker->addr.sbus_family &&
++		    addr->sbus_addr.s_addr == matchmaker->addr.sbus_addr.s_addr &&
++		    !memcmp(addr->sbus_path, matchmaker->addr.sbus_path,
++			   path_len)) {
++			kref_get(&matchmaker->kref);
++			if (delete)
++				hlist_del(&matchmaker->table_node);
++			spin_unlock(&matchrules_lock);
++			pr_debug("Found matchmaker for hash %llu", hash);
++			return matchmaker;
++		}
++	}
++	spin_unlock(&matchrules_lock);
++
++	if (!create) {
++		pr_debug("Matchmaker for hash %llu not found", hash);
++		return NULL;
++	}
++
++	matchmaker = bus_matchmaker_new(GFP_ATOMIC);
++	matchmaker->addr.sbus_family = addr->sbus_family;
++	matchmaker->addr.sbus_addr.s_addr = addr->sbus_addr.s_addr;
++	memcpy(matchmaker->addr.sbus_path, addr->sbus_path, BUS_PATH_MAX);
++	
++	pr_debug("Create new matchmaker for hash %llu\n", hash);
++	spin_lock(&matchrules_lock);
++	hlist_add_head(&matchmaker->table_node, &matchrules_table[hash]);
++	kref_get(&matchmaker->kref);
++	spin_unlock(&matchrules_lock);
++	return matchmaker;
++}
++
++static unsigned int dbus_filter(unsigned int hooknum,
++                                struct sk_buff *skb,
++                                const struct net_device *in,
++                                const struct net_device *out,
++                                int (*okfn)(struct sk_buff *))
++{
++	struct bus_send_context	*sendctx;
++	struct bus_match_maker *matchmaker = NULL;
++	struct bus_match_maker *sender = NULL;
++        struct dbus_message msg = {0,};
++        unsigned char *data;
++        size_t len;
++        int err;
++	int ret;
++
++	if (!skb->sk || skb->sk->sk_family != PF_BUS) {
++		WARN(1, "netfilter_dbus received an invalid skb");
++		return NF_DROP;
++	}
++
++        data = skb->data;
++	sendctx = BUSCB(skb).sendctx;
++	if (!sendctx || !sendctx->sender || !sendctx->sender_socket) {
++		WARN(1, "netfilter_dbus received an AF_BUS packet"
++		     " without context. This is a bug. Dropping the"
++			" packet.");
++        	return NF_DROP;
++	}
++	if (sendctx->sender_socket->sk->sk_protocol != BUS_PROTO_DBUS) {
++		/* This kernel module is for D-Bus. It must not
++		 * interfere with other users of AF_BUS. */
++        	return NF_ACCEPT;
++	}
++	if (sendctx->recipient) {
++		matchmaker = find_match_maker(sendctx->recipient, false, false);
++        }
++        len =  skb_tail_pointer(skb) - data;
++
++	if (sendctx->to_master && sendctx->main_recipient) {
++       		pr_debug("AF_BUS packet to the bus master. ACCEPT.\n");
++		ret = NF_ACCEPT;
++		goto out;
++	}
++
++	if (sendctx->main_recipient && !sendctx->bus_master_side) {
++       		pr_debug("AF_BUS packet from a peer to a peer (unicast). ACCEPT.\n");
++		ret = NF_ACCEPT;
++		goto out;
++	}
++
++        err = dbus_message_parse(data, len, &msg);
++        if (err) {
++		if (!sendctx->main_recipient) {
++	       		pr_debug("AF_BUS packet for an eavesdropper or "
++			         "multicast is not parsable. DROP.\n");
++			ret = NF_DROP;
++			goto out;
++		} else if (sendctx->bus_master_side) {
++	       		pr_debug("AF_BUS packet from bus master is not parsable. ACCEPT.\n");
++			ret = NF_ACCEPT;
++			goto out;
++		} else {
++	       		pr_debug("AF_BUS packet from peer is not parsable. DROP.\n");
++			ret = NF_DROP;
++			goto out;
++		}
++	}
++
++	if (sendctx->bus_master_side && !sendctx->main_recipient) {
++       		pr_debug("AF_BUS packet '%s' from the bus master is for an "
++		         "eavesdropper. DROP.\n",
++		       msg.member ? msg.member : "");
++		ret = NF_DROP;
++		goto out;
++	}
++	if (sendctx->bus_master_side) {
++		if (msg.name_acquired) {
++       			pr_debug("New name: %s [%p %p].\n",
++			       msg.name_acquired, sendctx->sender, sendctx->recipient);
++
++			sender = find_match_maker(sendctx->sender, true, false);
++			bus_matchmaker_add_name(sender, msg.name_acquired, GFP_ATOMIC);
++		}
++		if (msg.name_lost) {
++       			pr_debug("Lost name: %s [%p %p].\n",
++			       msg.name_lost, sendctx->sender, sendctx->recipient);
++
++			sender = find_match_maker(sendctx->sender, true, false);
++			bus_matchmaker_remove_name(sender, msg.name_acquired);
++		}
++
++       		pr_debug("AF_BUS packet '%s' from the bus master. ACCEPT.\n",
++		       msg.member ? msg.member : "");
++		ret = NF_ACCEPT;
++		goto out;
++	}
++
++       	pr_debug("Multicast AF_BUS packet, %d bytes, "
++	       "considering recipient %lld...\n", len,
++	       sendctx->recipient ? sendctx->recipient->sbus_addr.s_addr : 0);
++
++        pr_debug("Message type %d %s->%s [iface: %s][member: %s][matchmaker=%p]...\n",
++	       msg.type,
++	       msg.sender ? msg.sender : "",
++	       msg.destination ? msg.destination : "",
++	       msg.interface ? msg.interface : "",
++	       msg.member ? msg.member : "",
++	       matchmaker);
++
++	if (!matchmaker) {
++       		pr_debug("No match rules for this recipient. DROP.\n");
++		ret = NF_DROP;
++		goto out;
++	}
++
++	sender = find_match_maker(sendctx->sender, true, false);
++        err = bus_matchmaker_filter(matchmaker, sender, sendctx->eavesdropper,
++	                            &msg);
++        if (err) {
++       		pr_debug("Matchmaker: ACCEPT.\n");
++		ret = NF_ACCEPT;
++		goto out;
++        } else {
++       		pr_debug("Matchmaker: DROP.\n");
++		ret = NF_DROP;
++		goto out;
++	}
++
++out:
++	if (matchmaker)
++		kref_put(&matchmaker->kref, bus_matchmaker_free);
++	if (sender)
++		kref_put(&sender->kref, bus_matchmaker_free);
++	return ret;
++}
++
++/* Taken from drbd_nl_send_reply() */
++static void nfdbus_nl_send_reply(struct cn_msg *msg, int ret_code)
++{
++	char buffer[sizeof(struct cn_msg)+sizeof(struct nfdbus_nl_cfg_reply)];
++	struct cn_msg *cn_reply = (struct cn_msg *) buffer;
++	struct nfdbus_nl_cfg_reply *reply =
++		(struct nfdbus_nl_cfg_reply *)cn_reply->data;
++	int rr;
++
++	memset(buffer, 0, sizeof(buffer));
++	cn_reply->id = msg->id;
++
++	cn_reply->seq = msg->seq;
++	cn_reply->ack = msg->ack  + 1;
++	cn_reply->len = sizeof(struct nfdbus_nl_cfg_reply);
++	cn_reply->flags = 0;
++
++	reply->ret_code = ret_code;
++
++	rr = cn_netlink_send(cn_reply, 0, GFP_NOIO);
++	if (rr && rr != -ESRCH)
++		pr_debug("nfdbus: cn_netlink_send()=%d\n", rr);
++}
++
++static void cn_cmd_cb(struct net *net, struct cn_msg *msg, struct netlink_skb_parms *nsp)
++{
++	struct nfdbus_nl_cfg_req *nlp = (struct nfdbus_nl_cfg_req *)msg->data;
++        struct cn_msg *cn_reply;
++	struct nfdbus_nl_cfg_reply *reply;
++	int retcode, rr;
++	int reply_size = sizeof(struct cn_msg)
++		+ sizeof(struct nfdbus_nl_cfg_reply);
++
++	pr_debug("nfdbus: cn_cmd_cb called nsp->pid=%d.\n", nsp->pid);
++
++	if (!try_module_get(THIS_MODULE)) {
++		pr_debug(KERN_ERR "nfdbus: try_module_get() failed!\n");
++		return;
++	}
++
++	/*
++        if (!cap_raised(current_cap(), CAP_SYS_ADMIN)) {
++		pr_debug(KERN_ERR "nfdbus: no CAP_SYS_ADMIN!\n");
++		retcode = EPERM;
++		goto fail;
++	}
++        */
++
++        cn_reply = kzalloc(reply_size, GFP_KERNEL);
++        if (!cn_reply) {
++                retcode = ENOMEM;
++                goto fail;
++        }
++	reply = (struct nfdbus_nl_cfg_reply *) cn_reply->data;
++
++        if (msg->len < sizeof(struct nfdbus_nl_cfg_req)) {
++	        reply->ret_code = EINVAL;
++        } else if (nlp->cmd == NFDBUS_CMD_ADDMATCH) {
++                struct bus_match_rule *rule;
++		struct bus_match_maker *matchmaker;
++	        reply->ret_code = 0;
++
++                if (msg->len == 0)
++                       reply->ret_code = EINVAL;
++
++                rule = bus_match_rule_parse(nlp->data, GFP_ATOMIC);
++		if (rule) {
++			matchmaker = find_match_maker(&nlp->addr, true, false);
++			pr_debug("Add match rule for matchmaker %p\n", matchmaker);
++	                bus_matchmaker_add_rule(matchmaker, rule);
++			kref_put(&matchmaker->kref, bus_matchmaker_free);
++		} else {
++	        	reply->ret_code = EINVAL;
++		}
++        } else if (nlp->cmd == NFDBUS_CMD_REMOVEMATCH) {
++                struct bus_match_rule *rule;
++		struct bus_match_maker *matchmaker;
++
++                rule = bus_match_rule_parse(nlp->data, GFP_ATOMIC);
++		matchmaker = find_match_maker(&nlp->addr, false, false);
++		if (!matchmaker) {
++			reply->ret_code = EINVAL;
++		} else {
++			pr_debug("Remove match rule for matchmaker %p\n", matchmaker);
++			bus_matchmaker_remove_rule_by_value(matchmaker, rule);
++			kref_put(&matchmaker->kref, bus_matchmaker_free);
++	        	reply->ret_code = 0;
++		}
++		bus_match_rule_free(rule);
++		
++        } else if (nlp->cmd == NFDBUS_CMD_REMOVEALLMATCH) {
++		struct bus_match_maker *matchmaker;
++
++		matchmaker = find_match_maker(&nlp->addr, false, true);
++		if (!matchmaker) {
++			reply->ret_code = EINVAL;
++		} else {
++			pr_debug("Remove matchmaker %p\n", matchmaker);
++			kref_put(&matchmaker->kref, bus_matchmaker_free);
++			kref_put(&matchmaker->kref, bus_matchmaker_free);
++	        	reply->ret_code = 0;
++		}
++		
++        } else {
++	        reply->ret_code = EINVAL;
++        }
++
++	cn_reply->id = msg->id;
++	cn_reply->seq = msg->seq;
++	cn_reply->ack = msg->ack  + 1;
++	cn_reply->len = sizeof(struct nfdbus_nl_cfg_reply);
++	cn_reply->flags = 0;
++
++	rr = cn_netlink_reply(cn_reply, nsp->pid, GFP_KERNEL);
++	if (rr && rr != -ESRCH)
++		pr_debug("nfdbus: cn_netlink_send()=%d\n", rr);
++	pr_debug("nfdbus: cn_netlink_reply(pid=%d)=%d\n", nsp->pid, rr);
++
++	kfree(cn_reply);
++	module_put(THIS_MODULE);
++        return;
++fail:
++	nfdbus_nl_send_reply(msg, retcode);
++	module_put(THIS_MODULE);
++}
++
++static int __init nfdbus_init(void)
++{
++        int err;
++
++        pr_debug("Loading netfilter_dbus\n");
++
++        /* Install D-Bus netfilter hook */
++        nfho_dbus.hook     = dbus_filter;
++        nfho_dbus.hooknum  = NF_BUS_SENDING;
++        nfho_dbus.pf       = NFPROTO_BUS; /* Do not use PF_BUS, you fool! */
++        nfho_dbus.priority = 0;
++        nfho_dbus.owner = THIS_MODULE;
++        err = nf_register_hook(&nfho_dbus);
++        if (err)
++                return err;
++        pr_debug("Netfilter hook for D-Bus: installed.\n");
++
++        /* Install connector hook */
++        err = cn_add_callback(&cn_cmd_id, "nfdbus", cn_cmd_cb);
++        if (err)
++                goto err_cn_cmd_out;
++        pr_debug("Connector hook: installed.\n");
++
++        return 0;
++
++err_cn_cmd_out:
++        nf_unregister_hook(&nfho_dbus);
++
++        return err;
++}
++
++static void __exit nfdbus_cleanup(void)
++{
++        nf_unregister_hook(&nfho_dbus);
++
++        cn_del_callback(&cn_cmd_id);
++
++        pr_debug("Unloading netfilter_dbus\n");
++}
++
++module_init(nfdbus_init);
++module_exit(nfdbus_cleanup);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR(DRIVER_AUTHOR);
++MODULE_DESCRIPTION(DRIVER_DESC);
++MODULE_ALIAS_NET_PF_PROTO(PF_BUS, BUS_PROTO_DBUS);
+diff --git a/net/netfilter/nfdbus/nfdbus.h b/net/netfilter/nfdbus/nfdbus.h
+new file mode 100644
+index 0000000..5c6df55
+--- /dev/null
++++ b/net/netfilter/nfdbus/nfdbus.h
+@@ -0,0 +1,44 @@
++/*
++ * nfdbus.h  Netfilter module for AF_DBUS.
++ *
++ * Copyright (C) 2012  Collabora Ltd
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ *
++ */
++
++#ifndef NETFILTER_DBUS_H
++#define NETFILTER_DBUS_H
++
++#include <linux/types.h>
++#include <linux/bus.h>
++
++#define NFDBUS_CMD_ADDMATCH        0x01
++#define NFDBUS_CMD_REMOVEMATCH     0x02
++#define NFDBUS_CMD_REMOVEALLMATCH  0x03
++
++struct nfdbus_nl_cfg_req {
++        __u32 cmd;
++        __u32 len;
++        struct sockaddr_bus addr;
++        __u64 pad;
++        unsigned char data[0];
++};
++
++struct nfdbus_nl_cfg_reply {
++	__u32 ret_code;
++};
++
++#endif /* NETFILTER_DBUS_H */
+diff --git a/security/capability.c b/security/capability.c
+index bbb5115..9474c6e 100644
+--- a/security/capability.c
++++ b/security/capability.c
+@@ -560,6 +560,12 @@ static int cap_unix_may_send(struct socket *sock, struct socket *other)
+ 	return 0;
+ }
+ 
++static int cap_bus_stream_connect(struct sock *sock, struct sock *other,
++				  struct sock *newsk)
++{
++        return 0;
++}
++
+ static int cap_socket_create(int family, int type, int protocol, int kern)
+ {
+ 	return 0;
+@@ -1012,6 +1018,7 @@ void __init security_fixup_ops(struct security_operations *ops)
+ #ifdef CONFIG_SECURITY_NETWORK
+ 	set_to_cap_if_null(ops, unix_stream_connect);
+ 	set_to_cap_if_null(ops, unix_may_send);
++	set_to_cap_if_null(ops, bus_stream_connect);
+ 	set_to_cap_if_null(ops, socket_create);
+ 	set_to_cap_if_null(ops, socket_post_create);
+ 	set_to_cap_if_null(ops, socket_bind);
+diff --git a/security/security.c b/security/security.c
+index 4ba6d4c..d8be4e4 100644
+--- a/security/security.c
++++ b/security/security.c
+@@ -1004,6 +1004,12 @@ int security_unix_may_send(struct socket *sock,  struct socket *other)
+ }
+ EXPORT_SYMBOL(security_unix_may_send);
+ 
++int security_bus_stream_connect(struct sock *sock, struct sock *other, struct sock *newsk)
++{
++        return security_ops->bus_stream_connect(sock, other, newsk);
++}
++EXPORT_SYMBOL(security_bus_stream_connect);
++
+ int security_socket_create(int family, int type, int protocol, int kern)
+ {
+ 	return security_ops->socket_create(family, type, protocol, kern);
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index 20219ef..f84ac23 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -68,6 +68,7 @@
+ #include <linux/quota.h>
+ #include <linux/un.h>		/* for Unix socket types */
+ #include <net/af_unix.h>	/* for Unix socket types */
++#include <net/af_bus.h>	/* for Bus socket types */
+ #include <linux/parser.h>
+ #include <linux/nfs_mount.h>
+ #include <net/ipv6.h>
+@@ -4056,6 +4057,38 @@ static int selinux_socket_unix_may_send(struct socket *sock,
+ 			    &ad);
+ }
+ 
++static int selinux_socket_bus_stream_connect(struct sock *sock,
++					     struct sock *other,
++					     struct sock *newsk)
++{
++	struct sk_security_struct *sksec_sock = sock->sk_security;
++	struct sk_security_struct *sksec_other = other->sk_security;
++	struct sk_security_struct *sksec_new = newsk->sk_security;
++	struct common_audit_data ad;
++	int err;
++
++	COMMON_AUDIT_DATA_INIT(&ad, NET);
++	ad.u.net.sk = other;
++
++	err = avc_has_perm(sksec_sock->sid, sksec_other->sid,
++			   sksec_other->sclass,
++			   UNIX_STREAM_SOCKET__CONNECTTO, &ad);
++	if (err)
++		return err;
++
++	/* server child socket */
++	sksec_new->peer_sid = sksec_sock->sid;
++	err = security_sid_mls_copy(sksec_other->sid, sksec_sock->sid,
++				    &sksec_new->sid);
++	if (err)
++		return err;
++
++	/* connecting socket */
++	sksec_sock->peer_sid = sksec_new->sid;
++
++	return 0;
++}
++
+ static int selinux_inet_sys_rcv_skb(int ifindex, char *addrp, u16 family,
+ 				    u32 peer_sid,
+ 				    struct common_audit_data *ad)
+@@ -5591,6 +5624,7 @@ static struct security_operations selinux_ops = {
+ 
+ 	.unix_stream_connect =		selinux_socket_unix_stream_connect,
+ 	.unix_may_send =		selinux_socket_unix_may_send,
++	.bus_stream_connect =		selinux_socket_bus_stream_connect,
+ 
+ 	.socket_create =		selinux_socket_create,
+ 	.socket_post_create =		selinux_socket_post_create,
+-- 
+1.7.7.6
+
