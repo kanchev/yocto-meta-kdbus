@@ -1,0 +1,14 @@
+Yocto meta layer that adds kernel D-Bus support to the core and kernel recipies.
+
+Warning:
+  It has only been tested on beagleboard machine with yocto 1.2!
+
+Usage:
+  * Download and extract http://downloads.yoctoproject.org/releases/yocto/yocto-1.2/poky-denzil-7.0.tar.bz2
+  * Setup build environment:
+    $ source poky-denzil-7.0/oe-init-build-env build-kdbus
+  * Copy beagleboard test config:
+    $ cp ../yocto-meta-kdbus/test/beagleboard/local.conf conf
+  * Edit and add the absolute path to the yocto-meta-kdbus in conf/bblayers.conf
+  * Create a minimal yocto image:
+    $ bitbake core-image-minimal
