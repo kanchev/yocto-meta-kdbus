@@ -843,7 +843,7 @@ new file mode 100644
 index 0000000..e64e34f
 --- /dev/null
 +++ b/bus/driver-afbus.c
-@@ -0,0 +1,344 @@
+@@ -0,0 +1,345 @@
 +/* -*- mode: C; c-file-style: "gnu"; indent-tabs-mode: nil; -*- */
 +/* driver.c  Bus client, AF_BUS bits (driver)
 + *
@@ -1107,7 +1107,8 @@ index 0000000..e64e34f
 +  dbus_bool_t result = FALSE;
 +
 +  memset (&address, 0, sizeof (address));
-+  if (!dbus_connection_get_peer_address (addressed_recipient, &address, &len))
++  if (!dbus_connection_get_peer_address (addressed_recipient, &address, &len) ||
++      address.sbus_family != AF_BUS)
 +    {
 +      /* Don't return an error if it is not a AF_BUS socket */
 +      return TRUE;
