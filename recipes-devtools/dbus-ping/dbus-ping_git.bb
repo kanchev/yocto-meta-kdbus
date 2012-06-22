@@ -8,7 +8,7 @@ DEPENDS = "dbus"
 
 SRC_URI = "git://github.com/kanchev/dbus-ping.git;protocol=git"
 S = "${WORKDIR}/git/"
-SRCREV = "03e79b38d30bbd1db04b8608656b40336acdc2cc"
+SRCREV = "e22db57c31c87042e8a5863e07a1114391b04451"
 PV = "1+git${SRCPV}"
 PR = "r1"
 
