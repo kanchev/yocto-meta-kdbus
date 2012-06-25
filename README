@@ -12,3 +12,14 @@ Usage:
   * Edit and add the absolute path to the yocto-meta-kdbus in conf/bblayers.conf
   * Create a minimal yocto image:
     $ bitbake core-image-minimal
+
+BeagleBoard:
+  There is a performance regression when building the u-boot loader from source. For this reason
+  a binary image for the Beagleboard C4 from http://code.google.com/p/beagleboard/ is included.
+
+  You can easily verify a running beagleboard system by doing 'cat /proc/cpuinfo'. The value of
+  BogoMIPS should be around 700 and not 480!
+
+  Follow the installation instructions under
+  http://www.yoctoproject.org/download/bsp/texas-instruments-arm-cortex-a8-development-board-beagleboard-0
+
